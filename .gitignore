@@ -1,0 +1,11 @@
+/bin/
+/dist/
+/colony
+*.test
+*.out
+.DS_Store
+.env
+.env.*
+*.env
+*.pem
+*.key

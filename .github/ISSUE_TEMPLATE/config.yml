@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/hivecommons/colony/security/advisories/new
+    about: Please do not file vulnerabilities as public issues. See SECURITY.md.
+  - name: Join our Discord
+    url: https://hivecommons.dev/discord
+    about: Ask setup, contributor, and community questions in the Hive Commons Discord.
+  - name: Join the community meeting
+    url: https://docs.hivecommons.dev/docs/community/meetings
+    about: Public Hive Commons meeting every other Thursday, with schedule, join link, agenda and calendar.

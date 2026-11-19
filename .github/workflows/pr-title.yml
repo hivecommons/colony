@@ -1,0 +1,33 @@
+name: PR title
+
+# Every PR title starts with an emoji kind prefix, the same convention as the
+# other Hive Commons and KubeStellar repositories (see CONTRIBUTING.md).
+# Plain shell, no third-party action; the title is read from the event
+# payload through an env var, never interpolated into the script.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  title:
+    name: PR title emoji prefix
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the title prefix
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          for prefix in "✨" "🐛" "📖" "🌱" "⚠️" "⚠" "🚀" "🔒" "🧪" "♻️"; do
+            case "$TITLE" in
+              "$prefix"*) echo "PR title prefix ok: $prefix"; exit 0 ;;
+            esac
+          done
+          echo "::error::PR title must start with one of: ✨ feature, 🐛 bug fix, 📖 docs, 🌱 other/chore, ⚠️ breaking, 🚀 release, 🔒 security, 🧪 tests, ♻️ refactor"
+          exit 1
