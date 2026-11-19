@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/hivecommons/colony"
+	"github.com/hivecommons/colony/devstats"
 	"github.com/hivecommons/colony/fetch"
 	"github.com/hivecommons/colony/gitdm"
 	"github.com/hivecommons/colony/resolver"
@@ -89,10 +90,15 @@ func whois(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	cacheDir := fs.String("cache-dir", defaultCacheDir(), "snapshot cache directory (empty disables the disk cache)")
 	timeout := fs.Duration("timeout", fetch.DefaultTimeout, "per-request timeout")
 	gitdmBase := fs.String("gitdm-base-url", gitdm.DefaultBaseURL, "cncf/gitdm raw-content root (a mirror may be used)")
+	useDevstats := fs.Bool("devstats", false, "also ask CNCF DevStats for contribution activity (sends the GitHub login, never an email)")
+	devstatsProjects := fs.String("devstats-projects", "", "comma-separated DevStats project names to break activity down by, e.g. \"Kubernetes,Hive Commons\"")
+	devstatsRange := fs.String("devstats-range", devstats.DefaultRange, "DevStats range for the per-project breakdown")
+	devstatsBase := fs.String("devstats-base-url", devstats.DefaultBaseURL, "DevStats API endpoint")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "Usage: colony whois [flags] <github-login|email>")
 		_, _ = fmt.Fprintln(stderr, "\nA value containing \"@\" is matched as an email address, anything else as a GitHub login.")
 		_, _ = fmt.Fprintln(stderr, "gitdm data is downloaded once, cached, and matched locally: the login or email never leaves this host.")
+		_, _ = fmt.Fprintln(stderr, "--devstats is opt-in and sends the GitHub login (never an email) to devstats.cncf.io.")
 		_, _ = fmt.Fprintln(stderr, "\nFlags:")
 		fs.PrintDefaults()
 	}
@@ -113,7 +119,20 @@ func whois(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	client := fetch.New(fetch.Options{Timeout: *timeout, CacheDir: *cacheDir})
-	r := resolver.New(gitdm.New(gitdm.Options{BaseURL: *gitdmBase, Client: client}))
+	providers := []resolver.Provider{gitdm.New(gitdm.Options{BaseURL: *gitdmBase, Client: client})}
+	if *useDevstats {
+		providers = append(providers, devstats.New(devstats.Options{
+			BaseURL:  *devstatsBase,
+			Projects: splitList(*devstatsProjects),
+			Range:    *devstatsRange,
+			Client: fetch.New(fetch.Options{
+				Timeout:   *timeout,
+				RateLimit: devstats.DefaultRateLimit,
+				Burst:     devstats.DefaultBurst,
+			}),
+		}))
+	}
+	r := resolver.New(providers...)
 	res, err := r.Lookup(ctx, q)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "colony: %v\n", err)
@@ -136,6 +155,16 @@ func whois(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return exitNotFound
 	}
 	return exitOK
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func queryFor(arg string) resolver.Query {

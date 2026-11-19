@@ -129,3 +129,41 @@ func TestPrintHumanActivityAndWarnings(t *testing.T) {
 		t.Error("defaultCacheDir should resolve when HOME is set")
 	}
 }
+
+func TestWhoisWithDevstats(t *testing.T) {
+	base := gitdmServer(t)
+	var bodies []string
+	ds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			API string `json:"api"`
+		}
+		b := new(bytes.Buffer)
+		_, _ = b.ReadFrom(r.Body)
+		bodies = append(bodies, b.String())
+		_ = json.Unmarshal(b.Bytes(), &req)
+		if req.API == "GithubIDContributions" {
+			_, _ = w.Write([]byte(`{"contributions":42}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"login":["dims"],"number":[7],"rank":[1]}`))
+	}))
+	t.Cleanup(ds.Close)
+	code, out, errOut := runCLI(t, "whois", "--cache-dir", "", "--gitdm-base-url", base,
+		"--devstats", "--devstats-base-url", ds.URL, "--devstats-projects", " Kubernetes, ,Helm", "dims")
+	if code != exitOK {
+		t.Fatalf("exit %d, stderr %s", code, errOut)
+	}
+	for _, want := range []string{"NVIDIA Corporation", "All CNCF", "42", "Kubernetes", "Helm", "devstats"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if len(bodies) != 3 {
+		t.Errorf("devstats requests = %v", bodies)
+	}
+	// Without --devstats nothing is sent to DevStats.
+	bodies = nil
+	if code, _, _ := runCLI(t, "whois", "--cache-dir", "", "--gitdm-base-url", base, "--devstats-base-url", ds.URL, "dims"); code != exitOK || len(bodies) != 0 {
+		t.Errorf("devstats must be opt-in: exit %d, requests %v", code, bodies)
+	}
+}

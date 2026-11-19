@@ -56,6 +56,7 @@ func TestStatusErrors(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"upstream"}`))
 	}))
 	defer srv.Close()
 	c := New(Options{})
@@ -63,7 +64,8 @@ func TestStatusErrors(t *testing.T) {
 		t.Errorf("want ErrNotFound, got %v", err)
 	}
 	var se *StatusError
-	if _, err := c.Get(context.Background(), srv.URL+"/x"); !errors.As(err, &se) || se.Status != http.StatusBadGateway {
+	if _, err := c.Get(context.Background(), srv.URL+"/x"); !errors.As(err, &se) || se.Status != http.StatusBadGateway ||
+		string(se.Body) != `{"error":"upstream"}` {
 		t.Errorf("want StatusError 502, got %v", err)
 	}
 }
