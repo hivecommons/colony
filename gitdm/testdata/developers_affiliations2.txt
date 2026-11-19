@@ -1,0 +1,14 @@
+adohe: coolhzb!163.com
+	Alibaba Group
+brendandburns: bburns!google.com, bburns!microsoft.com, brendandburns!users.noreply.github.com, teeterc!gmail.com
+	Google LLC until 2016-07-15
+	Microsoft Corporation from 2016-07-15
+liggitt: jliggitt!redhat.com, jordan!liggitt.net, liggitt!google.com, liggitt!users.noreply.github.com
+	Red Hat Inc. until 2018-08-01
+	Google LLC from 2018-08-01
+FlorianOtel: FlorianOtel!users.noreply.github.com, florian.otel!gmail.com
+	Hewlett until 2014-04-01
+	Red Hat Inc. from 2014-04-01 until 2014-12-01
+	Nuage Networks from Nokia from 2014-12-01 until 2018-04-01
+	Microsoft Corporation from 2018-04-01 until 2019-09-01
+	Amazon from 2019-09-01
