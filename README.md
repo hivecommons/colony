@@ -26,7 +26,7 @@ host, and every outbound path is explicit and opt-in.
 | Provider | What leaves the host | Default |
 |---|---|---|
 | `gitdm` | Nothing per person. colony downloads the public `developers_affiliations*.txt` and alias files from cncf/gitdm over HTTPS GET (the same files for everyone), caches them on disk, and matches logins and emails **locally**. | the provider a consumer enables first |
-| `devstats` | The GitHub login only, sent to `devstats.cncf.io`. Never an email address. | opt-in |
+| `devstats` | The GitHub login only, in JSON POSTs to `https://devstats.cncf.io/api/v1` (one for the CNCF-wide total, plus one per configured project). Never an email address; an email-only query makes no request. | opt-in |
 | `crowddev` (LFX Insights) | The GitHub login only, with an API token you supply. Never an email address. | opt-in |
 
 All HTTP traffic goes through one shared client that:
@@ -70,6 +70,13 @@ Packages:
   `high` confidence, an email match with `medium` (gitdm calls its emails
   "best effort"). gitdm's placeholder values (`NotFound`, `(Unknown)`) are
   not reported as organisations; `Independent` is.
+- `devstats`: the CNCF DevStats provider. Uses the public DevStats API
+  (`GithubIDContributions` for the all-time CNCF-wide total, `DevActCnt` on
+  the All CNCF database for each project in `Options.Projects`, over
+  `Options.Range`, default `Last year`). `Provider.Projects` lists the valid
+  project names (`RepoGroups`). Rate-limited to 1 request per second by
+  default; answers are cached in memory for 24 hours. Each fact links to the
+  All CNCF developer activity dashboard.
 
 ## CLI
 
@@ -77,6 +84,7 @@ Packages:
 go install github.com/hivecommons/colony/cmd/colony@latest
 colony whois <github-login|email>
 colony whois --json <github-login|email>
+colony whois --devstats --devstats-projects "Kubernetes,Hive Commons" <github-login>
 ```
 
 A value containing `@` is matched as an email address; anything else (a

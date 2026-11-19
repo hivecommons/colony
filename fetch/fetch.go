@@ -32,6 +32,8 @@ const (
 	// DefaultMaxBodyBytes caps a response body. The largest cncf/gitdm
 	// affiliation file is about 1 MB.
 	DefaultMaxBodyBytes = 32 << 20
+	// maxErrorBodyBytes bounds how much of an error response is kept.
+	maxErrorBodyBytes = 4 << 10
 	// cacheDirPerm and cacheFilePerm keep cached snapshots private to the
 	// running user.
 	cacheDirPerm  = 0o700
@@ -45,10 +47,13 @@ var ErrNotFound = errors.New("fetch: not found")
 // never follows one.
 var ErrRedirect = errors.New("fetch: redirect refused")
 
-// StatusError is a non-success HTTP status.
+// StatusError is a non-success HTTP status. Body holds the start of the
+// response body (at most maxErrorBodyBytes), so callers can read an API's
+// JSON error message.
 type StatusError struct {
 	URL    string
 	Status int
+	Body   []byte
 }
 
 func (e *StatusError) Error() string {
@@ -172,7 +177,8 @@ func checkStatus(resp *http.Response) error {
 	case resp.StatusCode == http.StatusNotFound:
 		return fmt.Errorf("%w: %s", ErrNotFound, resp.Request.URL.Redacted())
 	case resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices:
-		return &StatusError{URL: resp.Request.URL.Redacted(), Status: resp.StatusCode}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		return &StatusError{URL: resp.Request.URL.Redacted(), Status: resp.StatusCode, Body: body}
 	}
 	return nil
 }
