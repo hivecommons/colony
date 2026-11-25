@@ -177,6 +177,12 @@ func TestSuggestionLifecycle(t *testing.T) {
 	if f, _ := mustGet(t, s, p.ID).Effective(FieldAffiliation); f.Suggested {
 		t.Error("re-suggesting an accepted value reverted the acceptance")
 	}
+	if res := suggest("Org Other", time.Hour); res.Stored || res.Reason != ReasonAccepted {
+		t.Errorf("a different suggestion over an accepted value = %+v, want ReasonAccepted", res)
+	}
+	if f, _ := mustGet(t, s, p.ID).Effective(FieldAffiliation); f.Value != "Org One" {
+		t.Errorf("accepted value replaced by %q", f.Value)
+	}
 
 	if err := s.DismissSuggestion(p.ID, FieldAffiliation, "owner"); err != nil {
 		t.Fatalf("DismissSuggestion: %v", err)

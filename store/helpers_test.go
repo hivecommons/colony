@@ -18,11 +18,15 @@ const (
 
 var testBase = time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 
+// testNow is the store clock: a day after testBase, so fixture timestamps
+// a few hours after testBase are in the past, not clamped as future.
+var testNow = testBase.Add(24 * time.Hour)
+
 func testOptions() Options {
 	return Options{
 		LockTimeout:     testLockTimeout,
 		FreeMailDomains: []string{testFreeMail},
-		Now:             func() time.Time { return testBase },
+		Now:             func() time.Time { return testNow },
 	}
 }
 

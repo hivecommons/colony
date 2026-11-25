@@ -359,7 +359,7 @@ func (p Person) dismissed(field, value string) bool {
 
 // factShareable reports whether a stored fact may leave the deployment.
 func (p Person) factShareable(f Fact) bool {
-	if f.Locality != LocalityShareable || slices.Contains(alwaysLocalFields, f.Field) {
+	if f.Locality != LocalityShareable || slices.Contains(alwaysLocalFields, canonicalField(f.Field)) {
 		return false
 	}
 	for _, ref := range f.DerivedFrom {
@@ -370,6 +370,15 @@ func (p Person) factShareable(f Fact) bool {
 	}
 	return true
 }
+
+// canonicalField folds a field name for the always-local and consent-first
+// checks, so "Notes " is treated as notes.
+func canonicalField(field string) string { return strings.ToLower(strings.TrimSpace(field)) }
+
+// IsAlwaysLocal reports whether identities of kind k never leave the
+// deployment: chat ids and OIDC subjects are account data, not customer
+// data.
+func (k Kind) IsAlwaysLocal() bool { return k == KindSlack || k == KindOIDC }
 
 // identityClass groups kinds that hold the same namespace of values, so an
 // address forgotten as git_email is also forgotten as email.

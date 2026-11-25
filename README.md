@@ -95,6 +95,7 @@ p, err := s.Upsert(store.PersonSpec{Identities: []store.Identity{
 for _, f := range store.FactsFromResult(res, q, time.Now()) {
 	_, err = s.SetFact(p.ID, f) // suggested enrichment, source and confidence intact
 }
+p, err = s.Get(p.ID)
 eff, ok := p.Effective(store.FieldAffiliation)
 shared, err := s.Export(store.ShareableFor(hiveID)) // the only export for a path that leaves the deployment
 ```
@@ -114,12 +115,20 @@ shared, err := s.Export(store.ShareableFor(hiveID)) // the only export for a pat
   it. A dismissed value is remembered and not suggested again.
 - **Locality:** every identity and fact is `shareable` or `local_only`, and
   an unset locality is stored as `local_only`. An email on any domain that is
-  not free-mail is always `local_only`, and so is every fact derived from a
-  `local_only` identity, plus `notes` and `slack_id`. `Shareable()` drops all
-  of them, together with consents and dismissals; `ShareableFor(scope)` also
-  drops `real_name` and `location` unless the person consented for that scope.
-- **Forget** erases the person and replaces each identity with a tombstone, so
-  neither `Upsert` nor `Import` adds it again.
+  not free-mail, a Slack id and an OIDC subject are always `local_only`, and
+  so is every fact derived from a `local_only` identity, plus `notes` and
+  `slack_id`.
+- **`Shareable()`** is the only export for a path that leaves the deployment.
+  It drops every `local_only` value, every email identity, `real_name` and
+  `location`, consents, dismissals and who set each value. A `local_only`
+  value hides the weaker ranks of its field, and a `local_only` clear is sent
+  as a bare clear, so a receiver never sees a value that was overridden or
+  cleared. `ShareableFor(scope)` also keeps `real_name` and `location` when
+  the person consented for that scope. Person ids are exported, so use opaque
+  ids.
+- **Forget** erases the person and tombstones the person id and each
+  identity, so neither `Upsert`, `Import` nor `Migrate` brings them back.
+  bbolt does not zero freed pages; compact the file to scrub them.
 - **Migration:** `Import` merges a snapshot (for example an unfiltered
   `Export`) in one transaction, and `Migrate` imports from a consumer's legacy
   store through the `Source` interface, recording its fingerprint once.

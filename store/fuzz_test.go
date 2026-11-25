@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -62,16 +63,32 @@ func FuzzImport(f *testing.F) {
 		fm := newFreeMail([]string{testFreeMail})
 		for i, p := range shared.People {
 			for _, id := range p.Identities {
-				if id.Locality != LocalityShareable {
-					t.Fatalf("shareable export holds a %q identity", id.Locality)
-				}
-				if id.Kind.IsEmail() && !fm.has(id.Value) {
-					t.Fatalf("shareable export holds a private-domain email")
+				if id.Locality != LocalityShareable || id.Kind.IsEmail() || id.Kind.IsAlwaysLocal() {
+					t.Fatalf("shareable export holds a %q %s identity", id.Locality, id.Kind)
 				}
 			}
 			for _, fa := range p.Facts {
-				if !full.People[i].factShareable(fa) {
-					t.Fatalf("shareable export holds fact %q that is not shareable", fa.Field)
+				field := canonicalField(fa.Field)
+				if slices.Contains(alwaysLocalFields, field) || slices.Contains(ConsentFirstFields, field) {
+					t.Fatalf("shareable export holds field %q", fa.Field)
+				}
+				if fa.By != "" || fa.AcceptedBy != "" {
+					t.Fatal("shareable export says who set a value")
+				}
+				if fa.Value == "" {
+					continue // a bare clear reveals nothing
+				}
+				if fa.Locality != LocalityShareable {
+					t.Fatalf("shareable export holds a %q fact", fa.Locality)
+				}
+				for _, ref := range fa.DerivedFrom {
+					if ref.Kind.IsEmail() && !fm.has(ref.Value) {
+						t.Fatal("shareable export holds a fact derived from a private-domain email")
+					}
+					held, ok := full.People[i].identity(ref)
+					if !ok || held.Locality != LocalityShareable {
+						t.Fatal("shareable export holds a fact derived from a local_only identity")
+					}
 				}
 			}
 			if len(p.Consents) > 0 || len(p.Dismissed) > 0 {

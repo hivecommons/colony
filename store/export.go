@@ -29,57 +29,83 @@ type Snapshot struct {
 // and false to drop the person entirely.
 type Filter func(Person) (Person, bool)
 
-// Shareable keeps only what may leave the deployment: shareable identities,
-// and shareable facts that were not derived from a local_only identity (or
-// from one the person no longer holds). Consents and dismissals are local
-// bookkeeping and are dropped. Every path that sends data to another
-// deployment must export through this filter.
+// Shareable keeps only what may leave the deployment, and is the filter every
+// path that sends data to another deployment must export through:
+//
+//   - shareable identities, except email kinds, which never leave;
+//   - per field, the shareable facts from the strongest rank down to the
+//     first fact that may not leave. A local_only explicit clear is sent as a
+//     bare clear, and a local_only value hides every weaker rank, so the
+//     receiver never sees a value the person cleared or overrode;
+//   - never ConsentFirstFields (use ShareableFor for a consented scope);
+//   - never consents, dismissals, or who set a value (By, AcceptedBy).
+//
+// The person id is exported as is, so consumers must use opaque ids.
 func Shareable() Filter {
 	return func(p Person) (Person, bool) { return ShareableView(p), true }
 }
 
+// ShareableFor is Shareable for a path that sends data to the deployment
+// identified by scope: it also keeps the ConsentFirstFields that an active
+// consent of the person for scope covers.
+func ShareableFor(scope string) Filter {
+	return func(p Person) (Person, bool) {
+		c, _ := p.Consent(scope)
+		return shareableView(p, c), true
+	}
+}
+
 // ShareableView applies the Shareable rules to one person.
-func ShareableView(p Person) Person {
+func ShareableView(p Person) Person { return shareableView(p, Consent{}) }
+
+func shareableView(p Person, consent Consent) Person {
 	out := Person{ID: p.ID, Status: p.Status, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt}
 	for _, i := range p.Identities {
-		if i.Locality == LocalityShareable {
+		if i.Locality == LocalityShareable && !i.Kind.IsEmail() {
 			out.Identities = append(out.Identities, i)
 		}
 	}
+	done := map[string]bool{}
 	for _, f := range p.Facts {
-		if p.factShareable(f) {
-			f.DerivedFrom = slices.Clone(f.DerivedFrom)
-			out.Facts = append(out.Facts, f)
+		if done[f.Field] {
+			continue
+		}
+		done[f.Field] = true
+		if slices.Contains(alwaysLocalFields, canonicalField(f.Field)) {
+			continue
+		}
+		if slices.Contains(ConsentFirstFields, canonicalField(f.Field)) && !consent.Covers(f.Field) {
+			continue
+		}
+		for _, rank := range rankOrder {
+			rf, ok := p.FactAt(f.Field, rank)
+			if !ok {
+				continue
+			}
+			if !p.factShareable(rf) {
+				if rf.Cleared() {
+					out.Facts = append(out.Facts, Fact{Field: rf.Field, Rank: rf.Rank, Source: rf.Source, Locality: LocalityShareable, At: rf.At})
+				}
+				break
+			}
+			rf.By, rf.AcceptedBy = "", ""
+			rf.DerivedFrom = slices.Clone(rf.DerivedFrom)
+			out.Facts = append(out.Facts, rf)
 		}
 	}
 	return out
 }
 
 // ConsentFirst drops every ConsentFirstFields fact unless the person holds
-// an active consent for scope that covers the field. It reads the consents
-// of the person it is given, so it must run before Shareable, which drops
-// them; run after it, it drops every consent-first field (fail closed).
-// ShareableFor combines the two in the right order.
+// an active consent for scope that covers the field. It narrows any export,
+// for example an unfiltered one handed to a local tool.
 func ConsentFirst(scope string) Filter {
 	return func(p Person) (Person, bool) {
 		c, _ := p.Consent(scope)
 		p.Facts = slices.DeleteFunc(slices.Clone(p.Facts), func(f Fact) bool {
-			return slices.Contains(ConsentFirstFields, f.Field) && !c.Covers(f.Field)
+			return slices.Contains(ConsentFirstFields, canonicalField(f.Field)) && !c.Covers(f.Field)
 		})
 		return p, true
-	}
-}
-
-// ShareableFor is the filter for a path that sends data to the deployment
-// identified by scope: ConsentFirst(scope), then Shareable.
-func ShareableFor(scope string) Filter {
-	consent, share := ConsentFirst(scope), Shareable()
-	return func(p Person) (Person, bool) {
-		p, keep := consent(p)
-		if !keep {
-			return p, false
-		}
-		return share(p)
 	}
 }
 
@@ -130,7 +156,10 @@ type ImportReport struct {
 }
 
 // Import merges a snapshot in one transaction: either every record is
-// written or none is. People are merged through the same rules as Upsert
+// written or none is. It is a restore into the same kind of deployment (an
+// unfiltered Export, or a consumer's own data): ranks are kept as they are,
+// so a value another deployment sent must be written with SetFact at
+// RankHubShared instead. People are merged through the same rules as Upsert
 // and SetFact, so importing never lets a weaker rank overwrite a stronger
 // one, and a forgotten identity is skipped rather than re-added.
 func (s *Store) Import(ctx context.Context, snap Snapshot) (ImportReport, error) {
@@ -258,15 +287,23 @@ func (s *Store) Migrate(ctx context.Context, name string, src Source, opts Migra
 	if err != nil {
 		return MigrateResult{}, fmt.Errorf("store: migration source fingerprint: %w", err)
 	}
-	prev, ran, err := s.Migration(name)
-	if err != nil {
-		return MigrateResult{}, err
-	}
-	if ran && !opts.Reimport {
-		return MigrateResult{Skipped: true, FingerprintChanged: prev.Fingerprint != fp, Record: prev}, nil
-	}
-	var rec MigrationRecord
+	var res MigrateResult
 	err = s.db.Update(func(tx *bolt.Tx) error {
+		// The check runs in the write transaction, so two callers cannot
+		// both run the same migration.
+		var prev MigrationRecord
+		ran := false
+		if raw := tx.Bucket(bucketMeta).Get([]byte(migrationPrefix + name)); raw != nil {
+			if err := json.Unmarshal(raw, &prev); err != nil {
+				return fmt.Errorf("store: decode migration record: %w", err)
+			}
+			ran = true
+		}
+		res.FingerprintChanged = ran && prev.Fingerprint != fp
+		if ran && !opts.Reimport {
+			res.Skipped, res.Record = true, prev
+			return nil
+		}
 		var rep ImportReport
 		if err := src.Records(ctx, func(r Record) error {
 			if err := ctx.Err(); err != nil {
@@ -276,8 +313,8 @@ func (s *Store) Migrate(ctx context.Context, name string, src Source, opts Migra
 		}); err != nil {
 			return err
 		}
-		rec = MigrationRecord{Name: name, Fingerprint: fp, At: s.now().UTC(), Report: rep}
-		raw, err := json.Marshal(rec)
+		res.Record = MigrationRecord{Name: name, Fingerprint: fp, At: s.now().UTC(), Report: rep}
+		raw, err := json.Marshal(res.Record)
 		if err != nil {
 			return err
 		}
@@ -286,7 +323,7 @@ func (s *Store) Migrate(ctx context.Context, name string, src Source, opts Migra
 	if err != nil {
 		return MigrateResult{}, err
 	}
-	return MigrateResult{FingerprintChanged: ran && prev.Fingerprint != fp, Record: rec}, nil
+	return res, nil
 }
 
 // Migration returns the record of the migration that ran under name.
@@ -332,8 +369,12 @@ func (s *Store) importRecord(tx *bolt.Tx, r Record, rep *ImportReport) error {
 		}
 		spec.Identities = append(spec.Identities, ident)
 	}
-	if spec.ID == "" && len(spec.Identities) == 0 {
-		// Nothing left to recognise this person by.
+	forgottenID := spec.ID != "" && tx.Bucket(bucketTombstones).Get(personTombstoneKey(tx, spec.ID)) != nil
+	allForgotten := len(r.Person.Identities) > 0 && len(spec.Identities) == 0
+	if forgottenID || allForgotten || (spec.ID == "" && len(spec.Identities) == 0) {
+		// A forgotten person, or one with nothing left to recognise them
+		// by, is not brought back.
+		rep.SkippedIdentities += len(spec.Identities)
 		rep.SkippedFacts += len(r.Facts)
 		return nil
 	}

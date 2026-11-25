@@ -84,9 +84,12 @@ func TestShareableNeverLeaksLocalOnly(t *testing.T) {
 		t.Errorf("shareable facts = %v, want %v", gotFields, wantFields)
 	}
 	for _, i := range shared.Identities {
-		if i.Value == privateEmail {
-			t.Errorf("shareable export holds the private email identity")
+		if i.Kind.IsEmail() {
+			t.Errorf("shareable export holds an email identity")
 		}
+	}
+	if len(shared.Identities) != 1 {
+		t.Errorf("shareable identities = %+v, want the login only", shared.Identities)
 	}
 	if len(shared.Consents) != 0 || len(shared.Dismissed) != 0 {
 		t.Error("shareable export holds consent or dismissal bookkeeping")
@@ -106,6 +109,45 @@ func TestShareableNeverLeaksLocalOnly(t *testing.T) {
 	}
 	if got := factFields(exportOne(t, s, Shareable())); slices.Contains(got, "from_free_email") {
 		t.Errorf("a fact derived from a now local_only identity is still shareable: %v", got)
+	}
+}
+
+func TestShareableHidesWhatAStrongerRankOverrode(t *testing.T) {
+	s := openTest(t)
+	p := mustUpsert(t, s, PersonSpec{ID: "p1", Identities: []Identity{githubIdentity(loginA)}})
+	// A clear with no locality is stored local_only; it must still hide
+	// the weaker value it cleared.
+	mustSet(t, s, p.ID, fact(FieldOrganization, "Org E", RankEnrichment))
+	mustSet(t, s, p.ID, Fact{Field: FieldOrganization, Rank: RankUser, Source: "test", At: testBase})
+	// A local_only value hides the weaker shareable value.
+	mustSet(t, s, p.ID, fact(FieldCountry, "AA", RankHubShared))
+	mustSet(t, s, p.ID, Fact{Field: FieldCountry, Value: "BB", Rank: RankUser, Source: "test", At: testBase})
+	// Shareable values at every rank are kept, without who set them.
+	admin := fact(FieldAffiliation, "Org A", RankAdmin)
+	admin.By = "admin-account"
+	mustSet(t, s, p.ID, admin)
+	mustSet(t, s, p.ID, fact(FieldAffiliation, "Org E", RankEnrichment))
+
+	shared := exportOne(t, s, Shareable())
+	var org, country, aff []Fact
+	for _, f := range shared.Facts {
+		switch f.Field {
+		case FieldOrganization:
+			org = append(org, f)
+		case FieldCountry:
+			country = append(country, f)
+		case FieldAffiliation:
+			aff = append(aff, f)
+		}
+	}
+	if len(org) != 1 || org[0].Value != "" || org[0].Rank != RankUser {
+		t.Errorf("organization = %+v, want the bare user clear only", org)
+	}
+	if len(country) != 0 {
+		t.Errorf("country = %+v, want nothing under a local_only user value", country)
+	}
+	if len(aff) != 2 || aff[0].By != "" {
+		t.Errorf("affiliation = %+v, want both ranks without By", aff)
 	}
 }
 
@@ -179,8 +221,8 @@ func TestConsentFirst(t *testing.T) {
 	if got := fields(); !slices.Equal(got, []string{FieldCountry, FieldRealName}) {
 		t.Errorf("with real_name consent: %v", got)
 	}
-	if got := factFields(exportOne(t, s, ConsentFirst(scope), Shareable())); !slices.Equal(got, []string{FieldCountry, FieldRealName}) {
-		t.Errorf("ConsentFirst then Shareable: %v", got)
+	if got := factFields(exportOne(t, s, ConsentFirst(scope), Shareable())); !slices.Equal(got, []string{FieldCountry}) {
+		t.Errorf("Shareable alone must drop consent-first fields: %v", got)
 	}
 	if got := factFields(exportOne(t, s, Shareable(), ConsentFirst(scope))); !slices.Equal(got, []string{FieldCountry}) {
 		t.Errorf("Shareable then ConsentFirst must fail closed: %v", got)

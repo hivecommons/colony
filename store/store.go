@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hivecommons/colony/resolver"
 	bolt "go.etcd.io/bbolt"
 	bolterrors "go.etcd.io/bbolt/errors"
 )
@@ -46,14 +47,20 @@ const SchemaVersion = 1
 // the file lock.
 const DefaultLockTimeout = 5 * time.Second
 
+// MaxClockSkew is how far in the future a fact's At may be before SetFact
+// clamps it to now.
+const MaxClockSkew = 5 * time.Minute
+
 // DefaultFileName is the conventional file name inside a deployment's data
 // directory.
 const DefaultFileName = "colony.db"
 
+// fileMode keeps the store readable by its owner only.
+const fileMode os.FileMode = 0o600
+
 const (
-	fileMode         os.FileMode = 0o600
-	saltBytes                    = 32
-	generatedIDBytes             = 16
+	saltBytes        = 32
+	generatedIDBytes = 16
 )
 
 var (
@@ -65,6 +72,10 @@ var (
 	keySchemaVersion = []byte("schema_version")
 	keySalt          = []byte("tombstone_salt")
 	migrationPrefix  = "migration:"
+
+	// personTombstoneClass is not an identity kind, so a person id can never
+	// collide with an identity tombstone.
+	personTombstoneClass = "person"
 )
 
 // ErrLocked is returned by Open when another process holds the file.
@@ -308,7 +319,7 @@ func (s *Store) upsertTx(tx *bolt.Tx, spec PersonSpec) (Person, error) {
 		}
 		idents = append(idents, ident)
 		// A private-domain email is local_only however it is upserted.
-		explicit = append(explicit, in.Locality != "" || (in.Kind.IsEmail() && !s.freeMail.has(ident.Value)))
+		explicit = append(explicit, in.Locality != "" || s.forcedLocal(in.Kind, ident.Value))
 	}
 	if spec.Status != "" {
 		if err := checkText("status", spec.Status, maxStatusBytes, false); err != nil {
@@ -344,6 +355,9 @@ func (s *Store) upsertTx(tx *bolt.Tx, spec PersonSpec) (Person, error) {
 	if err := checkID(id); err != nil {
 		return Person{}, err
 	}
+	if tx.Bucket(bucketTombstones).Get(personTombstoneKey(tx, id)) != nil {
+		return Person{}, fmt.Errorf("%w: person id", ErrTombstoned)
+	}
 	p, ok, err := loadPerson(tx, id)
 	if err != nil {
 		return Person{}, err
@@ -368,11 +382,13 @@ func (s *Store) upsertTx(tx *bolt.Tx, spec PersonSpec) (Person, error) {
 // stays verified, and an update that names no locality keeps the stored one
 // (prepareIdentity has already forced private-domain email to local_only).
 func mergeIdentity(p *Person, ident Identity, explicitLocality bool) {
-	v := normalizeValue(ident.Kind, ident.Value)
+	same := sameIdentity(ident.Ref())
 	for i, have := range p.Identities {
-		if have.Kind != ident.Kind || normalizeValue(have.Kind, have.Value) != v {
+		if !same(have.Ref()) {
 			continue
 		}
+		// The first kind recorded for an address is kept.
+		ident.Kind = have.Kind
 		ident.Verified = ident.Verified || have.Verified
 		if !explicitLocality {
 			ident.Locality = have.Locality
@@ -399,7 +415,7 @@ func (s *Store) prepareIdentity(in Identity, now time.Time) (Identity, error) {
 	out := in
 	out.Value = normalizeValue(in.Kind, in.Value)
 	out.Locality = in.Locality.orLocal()
-	if in.Kind.IsEmail() && !s.freeMail.has(out.Value) {
+	if s.forcedLocal(in.Kind, out.Value) {
 		out.Locality = LocalityLocalOnly
 	}
 	if out.At.IsZero() {
@@ -407,6 +423,12 @@ func (s *Store) prepareIdentity(in Identity, now time.Time) (Identity, error) {
 	}
 	out.At = out.At.UTC()
 	return out, nil
+}
+
+// forcedLocal reports whether an identity is local_only whatever the caller
+// asks: a private-domain email, a Slack id or an OIDC subject.
+func (s *Store) forcedLocal(k Kind, value string) bool {
+	return k.IsAlwaysLocal() || (k.IsEmail() && !s.freeMail.has(value))
 }
 
 // RemoveIdentity detaches an identity from a person without forgetting it.
@@ -440,6 +462,8 @@ const (
 	ReasonStale Reason = "stale"
 	// ReasonDismissed: the enrichment value was dismissed before.
 	ReasonDismissed Reason = "dismissed"
+	// ReasonAccepted: a suggestion did not replace an accepted value.
+	ReasonAccepted Reason = "accepted"
 )
 
 // SetResult reports what SetFact did.
@@ -480,9 +504,14 @@ func (s *Store) setFact(p *Person, in Fact) (SetResult, error) {
 		if f.At.Before(have.At) {
 			return SetResult{Reason: ReasonStale}, nil
 		}
-		if f.Suggested && !have.Suggested && normalizeFactValue(f.Value) == normalizeFactValue(have.Value) {
-			// A provider re-suggesting a value someone already accepted
-			// keeps the acceptance.
+		if f.Suggested && !have.Suggested && !have.Cleared() {
+			if normalizeFactValue(f.Value) != normalizeFactValue(have.Value) {
+				// A new suggestion never replaces a value someone
+				// accepted; the owner dismisses it first.
+				return SetResult{Reason: ReasonAccepted}, nil
+			}
+			// A provider re-suggesting the accepted value keeps the
+			// acceptance.
 			f.Suggested, f.AcceptedAt, f.AcceptedBy = false, have.AcceptedAt, have.AcceptedBy
 		}
 		p.Facts[i] = f
@@ -507,7 +536,7 @@ func (s *Store) prepareFact(p Person, in Fact) (Fact, error) {
 		return Fact{}, invalid("a hub_shared fact needs a %q source label", HubSourcePrefix)
 	}
 	switch in.Confidence {
-	case "", "high", "medium", "low":
+	case "", resolver.ConfidenceHigh, resolver.ConfidenceMedium, resolver.ConfidenceLow:
 	default:
 		return Fact{}, invalid("unknown confidence %q", in.Confidence)
 	}
@@ -534,8 +563,11 @@ func (s *Store) prepareFact(p Person, in Fact) (Fact, error) {
 		}
 		f.DerivedFrom = append(f.DerivedFrom, IdentityRef{Kind: ref.Kind, Value: normalizeValue(ref.Kind, ref.Value)})
 	}
-	if f.At.IsZero() {
-		f.At = s.now()
+	now := s.now().UTC()
+	if f.At.IsZero() || f.At.After(now.Add(MaxClockSkew)) {
+		// A timestamp from the future would lock the rank against every
+		// later write, so it is clamped to now.
+		f.At = now
 	}
 	f.At = f.At.UTC()
 	if f.Suggested {
@@ -677,9 +709,13 @@ func (s *Store) updateConsent(id, scope string, fn func(*Consent)) error {
 }
 
 // Forget erases the person completely: the record, every fact, consent and
-// dismissal, and the identity index. Each identity is replaced by a salted
-// hash tombstone, so Upsert and Import never add it again. It returns the
-// number of tombstones written.
+// dismissal, and the identity index. The person id and each identity are
+// replaced by salted hash tombstones, so neither Upsert, Import nor Migrate
+// brings them back. It returns the number of identity tombstones written.
+//
+// bbolt does not zero freed pages: the old record's bytes stay in the file,
+// unreachable, until the pages are reused. A consumer that must also scrub
+// the file (and its backups) compacts it, for example with "bbolt compact".
 func (s *Store) Forget(id string) (int, error) {
 	n := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
@@ -698,6 +734,9 @@ func (s *Store) Forget(id string) (int, error) {
 				return err
 			}
 			n++
+		}
+		if err := tx.Bucket(bucketTombstones).Put(personTombstoneKey(tx, id), s.stamp()); err != nil {
+			return err
 		}
 		return tx.Bucket(bucketPeople).Delete([]byte(id))
 	})
@@ -762,7 +801,16 @@ func tombstoneKey(tx *bolt.Tx, ref IdentityRef) []byte {
 }
 
 func (s *Store) tombstoneTx(tx *bolt.Tx, ref IdentityRef) error {
-	return tx.Bucket(bucketTombstones).Put(tombstoneKey(tx, ref), []byte(s.now().UTC().Format(time.RFC3339)))
+	return tx.Bucket(bucketTombstones).Put(tombstoneKey(tx, ref), s.stamp())
+}
+
+func (s *Store) stamp() []byte { return []byte(s.now().UTC().Format(time.RFC3339)) }
+
+// personTombstoneKey hashes a forgotten person id in its own namespace.
+func personTombstoneKey(tx *bolt.Tx, id string) []byte {
+	in := slices.Concat(tx.Bucket(bucketMeta).Get(keySalt), []byte(personTombstoneClass), []byte{0}, []byte(id))
+	sum := sha256.Sum256(in)
+	return []byte(hex.EncodeToString(sum[:]))
 }
 
 func (s *Store) tombstonedTx(tx *bolt.Tx, ref IdentityRef) (bool, error) {

@@ -18,7 +18,7 @@ import (
 func TestUpsertMergeAndConflict(t *testing.T) {
 	s := openTest(t)
 	p := mustUpsert(t, s, PersonSpec{ID: "p1", Identities: []Identity{githubIdentity(loginA)}})
-	if p.Status != StatusActive || !p.CreatedAt.Equal(testBase) {
+	if p.Status != StatusActive || !p.CreatedAt.Equal(testNow) {
 		t.Errorf("new person = %+v", p)
 	}
 
@@ -96,7 +96,8 @@ func TestForget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Export: %v", err)
 	}
-	if len(snap.People) != 1 || snap.People[0].ID != keep.ID || len(snap.Tombstones) != 2 {
+	// Two identities plus the person id.
+	if len(snap.People) != 1 || snap.People[0].ID != keep.ID || len(snap.Tombstones) != 3 {
 		t.Errorf("export after Forget = %d people, %d tombstones", len(snap.People), len(snap.Tombstones))
 	}
 	if _, err := s.Forget(p.ID); !errors.Is(err, ErrNotFound) {
@@ -117,6 +118,24 @@ func TestForget(t *testing.T) {
 	}
 	if _, err := s.FindByIdentity(KindGitHub, loginA); !errors.Is(err, ErrNotFound) {
 		t.Error("Import re-added a forgotten identity")
+	}
+	if _, err := s.Get("p3"); !errors.Is(err, ErrNotFound) {
+		t.Error("Import created a person whose every identity was forgotten")
+	}
+
+	// Nor does it bring back the forgotten person id, say from an old backup.
+	rep, err = s.Import(context.Background(), Snapshot{SchemaVersion: SchemaVersion, People: []Person{{
+		ID:    p.ID,
+		Facts: []Fact{fact(FieldRealName, "Test Person", RankUser)},
+	}}})
+	if err != nil || rep.People != 0 || rep.SkippedFacts != 1 {
+		t.Errorf("re-importing a forgotten id = %+v, %v", rep, err)
+	}
+	if _, err := s.Get(p.ID); !errors.Is(err, ErrNotFound) {
+		t.Error("Import brought back a forgotten person")
+	}
+	if _, err := s.Upsert(PersonSpec{ID: p.ID}); !errors.Is(err, ErrTombstoned) {
+		t.Errorf("Upsert of a forgotten id: err = %v, want ErrTombstoned", err)
 	}
 }
 
@@ -192,6 +211,23 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 	if st.People != writers*perWriter+1 || st.Identities != writers*perWriter || st.Facts[RankEnrichment] != 1 {
 		t.Errorf("stats = %+v", st)
+	}
+}
+
+func TestFutureTimestampIsClamped(t *testing.T) {
+	s := openTest(t)
+	p := mustUpsert(t, s, PersonSpec{ID: "p1"})
+	future := fact(FieldCountry, "AA", RankUser)
+	future.At = testNow.Add(MaxClockSkew + time.Hour)
+	mustSet(t, s, p.ID, future)
+	if f, _ := mustGet(t, s, p.ID).FactAt(FieldCountry, RankUser); !f.At.Equal(testNow) {
+		t.Errorf("future At stored as %v, want clamped to %v", f.At, testNow)
+	}
+	// A correction at the current time still lands.
+	now := fact(FieldCountry, "BB", RankUser)
+	now.At = testNow
+	if res := mustSet(t, s, p.ID, now); !res.Stored {
+		t.Errorf("correction after a future write = %+v, want stored", res)
 	}
 }
 
@@ -277,7 +313,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
-	if rep.People != 1 || rep.Facts != 2 || rep.Consents != 1 || rep.Tombstones != 1 {
+	if rep.People != 1 || rep.Facts != 2 || rep.Consents != 1 || rep.Tombstones != 2 {
 		t.Errorf("import report = %+v", rep)
 	}
 	got := mustGet(t, dst, p.ID)
