@@ -11,8 +11,9 @@ GitHub login or an email address:
 2. **What have they contributed to?** From
    [CNCF DevStats](https://devstats.cncf.io), per project.
 
-It is a Go library plus a small CLI (`colony whois`). It has no dependency on
-any consumer. [Hive](https://github.com/hivecommons/hive) is its first
+It is a Go library plus a small CLI (`colony whois`), and an embedded store
+(`store`) that keeps what a consumer knows about people, with the provenance
+of every value. It has no dependency on any consumer. [Hive](https://github.com/hivecommons/hive) is its first
 consumer, but nothing here knows about Hive.
 
 Status: early. See the [releases](https://github.com/hivecommons/colony/releases)
@@ -70,6 +71,7 @@ Packages:
   `high` confidence, an email match with `medium` (gitdm calls its emails
   "best effort"). gitdm's placeholder values (`NotFound`, `(Unknown)`) are
   not reported as organisations; `Independent` is.
+- `store`: the embedded customer-data store (see [Store](#store)).
 - `devstats`: the CNCF DevStats provider. Uses the public DevStats API
   (`GithubIDContributions` for the all-time CNCF-wide total, `DevActCnt` on
   the All CNCF database for each project in `Options.Projects`, over
@@ -77,6 +79,53 @@ Packages:
   project names (`RepoGroups`). Rate-limited to 1 request per second by
   default; answers are cached in memory for 24 hours. Each fact links to the
   All CNCF developer activity dashboard.
+
+## Store
+
+`store` is an embedded customer-data store over [bbolt](https://github.com/etcd-io/bbolt)
+(MIT). It is a library, not a service: it opens no listener and sends nothing
+anywhere. Each deployment opens its own file (`colony.db`), and bbolt's file
+lock keeps it to one process at a time.
+
+```go
+s, err := store.Open("/data/colony.db", store.Options{})
+p, err := s.Upsert(store.PersonSpec{Identities: []store.Identity{
+	{Kind: store.KindGitHub, Value: "octocat", Verified: true, Locality: store.LocalityShareable},
+}})
+for _, f := range store.FactsFromResult(res, q, time.Now()) {
+	_, err = s.SetFact(p.ID, f) // suggested enrichment, source and confidence intact
+}
+eff, ok := p.Effective(store.FieldAffiliation)
+shared, err := s.Export(store.ShareableFor(hiveID)) // the only export for a path that leaves the deployment
+```
+
+- **Schema** (versioned in `meta.schema_version`): a `Person` with a stable id
+  the caller may supply; `Identity` (`github`, `ghe`, `email`, `git_email`,
+  `slack`, `oidc`); `Fact` with field, value, rank, source, confidence,
+  locality, period, who and when, and a `suggested` flag; `Consent` per
+  scope; and salted-hash tombstones of forgotten identities.
+- **Precedence:** one fact per field per rank, and the strongest rank present
+  is effective: `user` > `admin` > `hub_shared` > `enrichment`. A write at
+  one rank never touches another, so enrichment never overwrites a value a
+  person or an administrator set. At the same rank the newer value wins. An
+  empty value is an explicit clear. A `hub_shared` source is always labelled
+  `hub:<label>`.
+- **Suggestions:** an enrichment value is `suggested` until someone accepts
+  it. A dismissed value is remembered and not suggested again.
+- **Locality:** every identity and fact is `shareable` or `local_only`, and
+  an unset locality is stored as `local_only`. An email on any domain that is
+  not free-mail is always `local_only`, and so is every fact derived from a
+  `local_only` identity, plus `notes` and `slack_id`. `Shareable()` drops all
+  of them, together with consents and dismissals; `ShareableFor(scope)` also
+  drops `real_name` and `location` unless the person consented for that scope.
+- **Forget** erases the person and replaces each identity with a tombstone, so
+  neither `Upsert` nor `Import` adds it again.
+- **Migration:** `Import` merges a snapshot (for example an unfiltered
+  `Export`) in one transaction, and `Migrate` imports from a consumer's legacy
+  store through the `Source` interface, recording its fingerprint once.
+  `Stats` returns counts only, for parity logs.
+- A file written by a newer colony release fails `Open` with
+  `ErrSchemaTooNew` and is left untouched.
 
 ## CLI
 
