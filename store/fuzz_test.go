@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"github.com/hivecommons/colony/resolver"
 )
 
 // FuzzImport feeds arbitrary snapshots to Import. Whatever is accepted, a
@@ -26,8 +28,11 @@ func FuzzImport(f *testing.F) {
 			{Field: FieldCountry, Value: "AA", Rank: RankHubShared, Source: "hub:person", Locality: LocalityShareable},
 			{Field: FieldNotes, Value: "note", Rank: RankAdmin, Source: "admin", Locality: LocalityShareable},
 		},
-		Consents: []Consent{{Scope: "hub", Fields: []string{FieldRealName}}},
-	}}}
+		Consents:    []Consent{{Scope: "hub", Fields: []string{FieldRealName}, DeliveredFields: []string{FieldRealName}, DeliveredRev: "r1"}},
+		Held:        []HeldIdentity{{Identity: Identity{Kind: KindGitHub, Value: loginB, Locality: LocalityShareable, By: "admin-1"}}},
+		Answers:     []Answer{{Source: "colony:gitdm", Affiliations: []resolver.Affiliation{{Org: "Org One", Source: "gitdm"}}}},
+		Attachments: map[string]json.RawMessage{"consumer": json.RawMessage(`{"k":"v"}`)},
+	}}, Attachments: map[string]json.RawMessage{"consumer": json.RawMessage(`{"doc":1}`)}}
 	raw, err := json.Marshal(seed)
 	if err != nil {
 		f.Fatal(err)
@@ -94,9 +99,17 @@ func FuzzImport(f *testing.F) {
 			if len(p.Consents) > 0 || len(p.Dismissed) > 0 {
 				t.Fatal("shareable export holds consent or dismissal bookkeeping")
 			}
+			if len(p.Held) > 0 || len(p.Answers) > 0 || len(p.Attachments) > 0 {
+				t.Fatal("shareable export holds held identities, answers or attachments")
+			}
+			for _, id := range p.Identities {
+				if id.By != "" {
+					t.Fatal("shareable export says who linked an identity")
+				}
+			}
 		}
-		if len(shared.Tombstones) > 0 || shared.TombstoneSalt != "" {
-			t.Fatal("shareable export holds tombstones")
+		if len(shared.Tombstones) > 0 || shared.TombstoneSalt != "" || len(shared.Attachments) > 0 {
+			t.Fatal("shareable export holds tombstones or store attachments")
 		}
 	})
 }

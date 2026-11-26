@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -139,16 +140,39 @@ var ConsentFirstFields = []string{FieldRealName, FieldLocation}
 const StatusActive = "active"
 
 // Size limits keep one person record small and keys inside bbolt's limits.
+// The exported ones are the limits a consumer may need to check a value
+// against before writing it (see CheckFactValue).
 const (
-	maxIDBytes       = 128
+	// MaxIDBytes bounds a person id and a consent scope.
+	MaxIDBytes = 128
+	// MaxIdentityBytes bounds an identity value.
+	MaxIdentityBytes = 512
+	// MaxValueBytes bounds a fact value, except FieldNotes.
+	MaxValueBytes = 4096
+	// MaxNotesBytes bounds a FieldNotes value: an administrator's free text,
+	// which is longer than any other field.
+	MaxNotesBytes = 64 << 10
+	// MaxAttachmentBytes bounds the attachments of one person, all
+	// namespaces together.
+	MaxAttachmentBytes = 1 << 20
+	// MaxStoreAttachmentBytes bounds one store-level attachment.
+	MaxStoreAttachmentBytes = 64 << 20
+
 	maxFieldBytes    = 64
 	maxSourceBytes   = 128
 	maxStatusBytes   = 64
-	maxIdentityBytes = 512
-	maxValueBytes    = 4096
 	maxByBytes       = 256
 	maxConsentFields = 64
+	maxHeld          = 64
+	maxAnswers       = 16
+	maxAnswerAffs    = 50
+	maxAnswerActs    = 100
+	maxAnswerText    = 512
+	maxAnswerURL     = 2048
 )
+
+// identityScoreMax is the upper bound of Identity.Score.
+const identityScoreMax = 1.0
 
 // Errors returned by the store.
 var (
@@ -158,6 +182,7 @@ var (
 	ErrIdentityConflict = errors.New("store: identity belongs to another person")
 	ErrSchemaTooNew     = errors.New("store: file schema is newer than this colony release")
 	ErrSaltMismatch     = errors.New("store: snapshot tombstones were hashed with another salt")
+	ErrNoAnswer         = errors.New("store: no answer from that source")
 )
 
 func invalid(format string, args ...any) error {
@@ -178,6 +203,43 @@ type Identity struct {
 	Locality Locality  `json:"locality"`
 	Source   string    `json:"source,omitempty"`
 	At       time.Time `json:"at,omitzero"`
+	// Manual marks an identity a person linked by hand, rather than one a
+	// consumer's automatic resolution found. Once set it stays set.
+	Manual bool `json:"manual,omitempty"`
+	// By is who linked the identity. It never leaves the deployment.
+	By string `json:"by,omitempty"`
+	// Score is the consumer's numeric confidence in the link, in [0, 1];
+	// zero means not recorded.
+	Score float64 `json:"score,omitempty"`
+}
+
+// HeldIdentity is an identity a person claims that colony does not give
+// them, because another person owns it: an identity has one owner. It is
+// kept on the claimant instead of being refused, so no data is lost, but it
+// is not in the identity index, so it never resolves to the claimant,
+// FindByIdentity never returns them for it, and it never leaves the
+// deployment. Contested names every claimant of an identity.
+type HeldIdentity struct {
+	Identity
+	// Owner is the person that owned the identity when it was held, or
+	// empty when nobody did. It is a snapshot: Contested reads the live
+	// owner from the identity index.
+	Owner string `json:"owner,omitempty"`
+}
+
+// Answer is one provider's last answer about a person, in full: every
+// affiliation with its period, and every activity with its project name,
+// period and link. A Fact holds one value per field per rank, the one that
+// is effective; the Answer keeps the detail and the history behind it, and
+// when the source last answered. A person holds at most one Answer per
+// Source. Answers never leave the deployment (Shareable drops them).
+type Answer struct {
+	// Source names the provider, for example "colony:gitdm".
+	Source string `json:"source"`
+	// FetchedAt is when the source last answered.
+	FetchedAt    time.Time              `json:"fetched_at,omitzero"`
+	Affiliations []resolver.Affiliation `json:"affiliations,omitempty"`
+	Activity     []resolver.Activity    `json:"activity,omitempty"`
 }
 
 // Ref returns the identity's reference.
@@ -221,7 +283,30 @@ type Consent struct {
 	TextVersion string    `json:"text_version,omitempty"`
 	GrantedAt   time.Time `json:"granted_at,omitzero"`
 	WithdrawnAt time.Time `json:"withdrawn_at,omitzero"`
-	DeliveredAt time.Time `json:"delivered_at,omitzero"`
+	// UpdatedAt is when the grant last changed (SetConsent stamps it when
+	// the caller leaves it zero, WithdrawConsent always). A delivery does
+	// not change it; the delivery fields below record those.
+	UpdatedAt time.Time `json:"updated_at,omitzero"`
+	// Delivery bookkeeping, written by RecordDelivery: DeliveredAt is the
+	// last delivery and FirstDeliveredAt the first; DeliveredFields is every
+	// field ever delivered to the scope, LastDeliveredFields what the last
+	// delivery carried, and DeliveredRev the consumer's revision of it.
+	DeliveredAt         time.Time `json:"delivered_at,omitzero"`
+	FirstDeliveredAt    time.Time `json:"first_delivered_at,omitzero"`
+	DeliveredFields     []string  `json:"delivered_fields,omitempty"`
+	LastDeliveredFields []string  `json:"last_delivered_fields,omitempty"`
+	DeliveredRev        string    `json:"delivered_rev,omitempty"`
+}
+
+// Delivered reports whether anything was ever delivered under the consent.
+func (c Consent) Delivered() bool { return !c.DeliveredAt.IsZero() || !c.FirstDeliveredAt.IsZero() }
+
+// Delivery is one delivery of consented fields, for RecordDelivery.
+type Delivery struct {
+	Fields []string
+	Rev    string
+	// At is when it was delivered; zero means now.
+	At time.Time
 }
 
 // Active reports whether the consent is granted and not withdrawn since.
@@ -256,6 +341,14 @@ type Person struct {
 	Facts      []Fact      `json:"facts,omitempty"`
 	Consents   []Consent   `json:"consents,omitempty"`
 	Dismissed  []Dismissal `json:"dismissed,omitempty"`
+	// Held are identities the person claims that another person owns.
+	Held []HeldIdentity `json:"held,omitempty"`
+	// Answers are the providers' last answers, one per source.
+	Answers []Answer `json:"answers,omitempty"`
+	// Attachments are consumer data colony does not interpret, by consumer
+	// namespace: each value is a JSON document. They are local_only (never
+	// exported by Shareable) and erased with the person by Forget.
+	Attachments map[string]json.RawMessage `json:"attachments,omitempty"`
 }
 
 // ViewOptions tunes EffectiveView.
@@ -338,6 +431,30 @@ func (p Person) identity(ref IdentityRef) (Identity, bool) {
 	return Identity{}, false
 }
 
+// Answer returns the person's answer from source.
+func (p Person) Answer(source string) (Answer, bool) {
+	for _, a := range p.Answers {
+		if a.Source == source {
+			return a, true
+		}
+	}
+	return Answer{}, false
+}
+
+// HoldsIdentity reports whether the person holds the identity as a
+// HeldIdentity (claimed, owned by someone else).
+func (p Person) HoldsIdentity(ref IdentityRef) bool { return p.heldIndex(ref) >= 0 }
+
+func (p Person) heldIndex(ref IdentityRef) int {
+	same := sameIdentity(ref)
+	for i, h := range p.Held {
+		if same(h.Ref()) {
+			return i
+		}
+	}
+	return -1
+}
+
 func (p Person) factIndex(field string, rank Rank) int {
 	for i, f := range p.Facts {
 		if f.Field == field && f.Rank == rank {
@@ -408,6 +525,12 @@ func normalizeFactValue(v string) string {
 }
 
 func checkText(what, s string, maxBytes int, required bool) error {
+	return checkTextAllowing(what, s, maxBytes, required, false)
+}
+
+// checkTextAllowing is checkText; with cr set a carriage return is allowed
+// too, as in pasted free text.
+func checkTextAllowing(what, s string, maxBytes int, required, cr bool) error {
 	if required && strings.TrimSpace(s) == "" {
 		return invalid("%s is required", what)
 	}
@@ -418,20 +541,40 @@ func checkText(what, s string, maxBytes int, required bool) error {
 		return invalid("%s is not valid UTF-8", what)
 	}
 	for _, r := range s {
-		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' && (!cr || r != '\r') {
 			return invalid("%s holds a control character", what)
 		}
 	}
 	return nil
 }
 
-func checkID(id string) error { return checkText("person id", id, maxIDBytes, true) }
+// maxAnswersBytes bounds the encoded answers of one person.
+const maxAnswersBytes = 256 << 10
+
+// ValueLimit is the most bytes a value of field may hold: MaxNotesBytes for
+// FieldNotes, MaxValueBytes for every other field.
+func ValueLimit(field string) int {
+	if canonicalField(field) == FieldNotes {
+		return MaxNotesBytes
+	}
+	return MaxValueBytes
+}
+
+// CheckFactValue reports whether SetFact would accept value for field: valid
+// UTF-8, at most ValueLimit(field) bytes, and no control character other
+// than newline and tab (and, in FieldNotes, carriage return: pasted free
+// text). It wraps ErrInvalid.
+func CheckFactValue(field, value string) error {
+	return checkTextAllowing("fact value", value, ValueLimit(field), false, canonicalField(field) == FieldNotes)
+}
+
+func checkID(id string) error { return checkText("person id", id, MaxIDBytes, true) }
 
 func checkRef(ref IdentityRef) error {
 	if !ref.Kind.Valid() {
 		return invalid("unknown identity kind %q", ref.Kind)
 	}
-	if err := checkText("identity value", ref.Value, maxIdentityBytes, true); err != nil {
+	if err := checkText("identity value", ref.Value, MaxIdentityBytes, true); err != nil {
 		return err
 	}
 	if strings.ContainsAny(ref.Value, "\n\t") {

@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -41,7 +42,12 @@ import (
 
 // SchemaVersion is the schema this release writes. Open upgrades an older
 // file and refuses a newer one.
-const SchemaVersion = 1
+//
+// Version 2 (v0.4.0) adds identity provenance (Manual, By, Score), held
+// identities and their index, provider answers, attachments, and the
+// consent delivery bookkeeping. Every new field is optional, so a version 1
+// record reads unchanged.
+const SchemaVersion = 2
 
 // DefaultLockTimeout is how long Open waits for another process to release
 // the file lock.
@@ -68,10 +74,15 @@ var (
 	bucketPeople     = []byte("people")
 	bucketIdentities = []byte("identities")
 	bucketTombstones = []byte("tombstones")
+	// bucketHeld indexes held identities: identity key to the ids of the
+	// people holding it.
+	bucketHeld = []byte("held")
 
 	keySchemaVersion = []byte("schema_version")
 	keySalt          = []byte("tombstone_salt")
 	migrationPrefix  = "migration:"
+	// attachmentPrefix keys store-level attachments in the meta bucket.
+	attachmentPrefix = "attachment:"
 
 	// personTombstoneClass is not an identity kind, so a person id can never
 	// collide with an identity tombstone.
@@ -93,6 +104,7 @@ var ErrNoConsent = errors.New("store: no consent record for scope")
 // at the old version.
 var upgrades = []func(tx *bolt.Tx) error{
 	upgradeV0toV1,
+	upgradeV1toV2,
 }
 
 func upgradeV0toV1(tx *bolt.Tx) error {
@@ -102,6 +114,14 @@ func upgradeV0toV1(tx *bolt.Tx) error {
 		}
 	}
 	return nil
+}
+
+// upgradeV1toV2 adds the held-identity index. Version 1 records hold no
+// held identity, so the index starts empty; every other version 2 field is
+// optional in the record itself.
+func upgradeV1toV2(tx *bolt.Tx) error {
+	_, err := tx.CreateBucketIfNotExists(bucketHeld)
+	return err
 }
 
 // Options configures Open.
@@ -276,11 +296,21 @@ type PersonSpec struct {
 	// without one gets StatusActive.
 	Status     string     `json:"status,omitempty"`
 	Identities []Identity `json:"identities,omitempty"`
+	// Held are identities the person claims without owning them: they are
+	// kept as HeldIdentity, whoever owns them (see Person.Held).
+	Held []Identity `json:"held,omitempty"`
+	// HoldConflicts makes an identity in Identities that another person
+	// owns a held identity, instead of failing the upsert with
+	// ErrIdentityConflict.
+	HoldConflicts bool `json:"hold_conflicts,omitempty"`
 }
 
 // Upsert creates the person or adds identities to it. An identity that
-// another person holds fails with ErrIdentityConflict, and a forgotten one
-// with ErrTombstoned; either way nothing is written.
+// another person owns fails with ErrIdentityConflict, unless
+// spec.HoldConflicts is set, and a forgotten one with ErrTombstoned; either
+// way nothing is written. Without an id, the person is the owner of the
+// first identity someone owns (so with HoldConflicts the rest are held
+// there); a claimant should pass its own id.
 func (s *Store) Upsert(spec PersonSpec) (Person, error) {
 	var p Person
 	err := s.db.Update(func(tx *bolt.Tx) error {
@@ -321,14 +351,24 @@ func (s *Store) upsertTx(tx *bolt.Tx, spec PersonSpec) (Person, error) {
 		// A private-domain email is local_only however it is upserted.
 		explicit = append(explicit, in.Locality != "" || s.forcedLocal(in.Kind, ident.Value))
 	}
+	if len(spec.Held) > maxHeld {
+		return Person{}, invalid("more than %d held identities", maxHeld)
+	}
+	held := make([]Identity, 0, len(spec.Held))
+	for _, in := range spec.Held {
+		ident, err := s.prepareIdentity(in, now)
+		if err != nil {
+			return Person{}, err
+		}
+		held = append(held, ident)
+	}
 	if spec.Status != "" {
 		if err := checkText("status", spec.Status, maxStatusBytes, false); err != nil {
 			return Person{}, err
 		}
 	}
 	index := tx.Bucket(bucketIdentities)
-	id := spec.ID
-	for _, ident := range idents {
+	for _, ident := range slices.Concat(idents, held) {
 		tomb, err := s.tombstonedTx(tx, ident.Ref())
 		if err != nil {
 			return Person{}, err
@@ -336,15 +376,31 @@ func (s *Store) upsertTx(tx *bolt.Tx, spec PersonSpec) (Person, error) {
 		if tomb {
 			return Person{}, fmt.Errorf("%w: %s", ErrTombstoned, ident.Kind)
 		}
+	}
+	id := spec.ID
+	if id == "" {
+		for _, ident := range idents {
+			if owner := index.Get(indexKey(ident.Ref())); owner != nil {
+				id = string(owner)
+				break
+			}
+		}
+	}
+	// An identity another person owns fails the upsert, or with
+	// HoldConflicts is held instead.
+	var owned []Identity
+	var ownedExplicit []bool
+	for i, ident := range idents {
 		owner := index.Get(indexKey(ident.Ref()))
-		if owner == nil {
+		if owner != nil && string(owner) != id {
+			if !spec.HoldConflicts {
+				return Person{}, fmt.Errorf("%w: %s", ErrIdentityConflict, ident.Kind)
+			}
+			held = append(held, ident)
 			continue
 		}
-		if id == "" {
-			id = string(owner)
-		} else if string(owner) != id {
-			return Person{}, fmt.Errorf("%w: %s", ErrIdentityConflict, ident.Kind)
-		}
+		owned = append(owned, ident)
+		ownedExplicit = append(ownedExplicit, explicit[i])
 	}
 	if id == "" {
 		var err error
@@ -368,11 +424,27 @@ func (s *Store) upsertTx(tx *bolt.Tx, spec PersonSpec) (Person, error) {
 	if spec.Status != "" {
 		p.Status = spec.Status
 	}
-	for i, ident := range idents {
-		mergeIdentity(&p, ident, explicit[i])
+	for i, ident := range owned {
+		mergeIdentity(&p, ident, ownedExplicit[i])
 		if err := index.Put(indexKey(ident.Ref()), []byte(id)); err != nil {
 			return Person{}, err
 		}
+		// An identity the person now owns is no longer only held.
+		if err := dropHeldTx(tx, &p, ident.Ref()); err != nil {
+			return Person{}, err
+		}
+	}
+	for _, ident := range held {
+		if p.HasIdentity(ident.Ref()) {
+			continue
+		}
+		owner := string(index.Get(indexKey(ident.Ref())))
+		if err := holdTx(tx, &p, HeldIdentity{Identity: ident, Owner: owner}); err != nil {
+			return Person{}, err
+		}
+	}
+	if len(p.Held) > maxHeld {
+		return Person{}, invalid("more than %d held identities", maxHeld)
 	}
 	p.UpdatedAt = now
 	return p, putPerson(tx, p)
@@ -390,11 +462,18 @@ func mergeIdentity(p *Person, ident Identity, explicitLocality bool) {
 		// The first kind recorded for an address is kept.
 		ident.Kind = have.Kind
 		ident.Verified = ident.Verified || have.Verified
+		ident.Manual = ident.Manual || have.Manual
 		if !explicitLocality {
 			ident.Locality = have.Locality
 		}
 		if ident.Source == "" {
 			ident.Source = have.Source
+		}
+		if ident.By == "" {
+			ident.By = have.By
+		}
+		if ident.Score == 0 {
+			ident.Score = have.Score
 		}
 		p.Identities[i] = ident
 		return
@@ -411,6 +490,12 @@ func (s *Store) prepareIdentity(in Identity, now time.Time) (Identity, error) {
 	}
 	if err := checkText("identity source", in.Source, maxSourceBytes, false); err != nil {
 		return Identity{}, err
+	}
+	if err := checkText("identity by", in.By, maxByBytes, false); err != nil {
+		return Identity{}, err
+	}
+	if math.IsNaN(in.Score) || in.Score < 0 || in.Score > identityScoreMax {
+		return Identity{}, invalid("identity score %v is outside [0, 1]", in.Score)
 	}
 	out := in
 	out.Value = normalizeValue(in.Kind, in.Value)
@@ -546,7 +631,7 @@ func (s *Store) prepareFact(p Person, in Fact) (Fact, error) {
 	if in.Suggested && in.Rank != RankEnrichment {
 		return Fact{}, invalid("only an enrichment fact can be a suggestion")
 	}
-	if err := checkText("fact value", in.Value, maxValueBytes, false); err != nil {
+	if err := CheckFactValue(in.Field, in.Value); err != nil {
 		return Fact{}, err
 	}
 	if err := checkText("fact by", in.By, maxByBytes, false); err != nil {
@@ -649,34 +734,67 @@ func (s *Store) DismissSuggestion(id, field, by string) error {
 	})
 }
 
-// SetConsent records or replaces the consent for c.Scope.
+// SetConsent records or replaces the consent for c.Scope. A zero UpdatedAt
+// is stamped now.
 func (s *Store) SetConsent(id string, c Consent) error {
 	if err := checkConsent(c); err != nil {
 		return err
 	}
+	if c.UpdatedAt.IsZero() {
+		c.UpdatedAt = s.now().UTC()
+	}
 	return s.update(id, func(_ *bolt.Tx, p *Person) (bool, error) {
+		if have, ok := p.Consent(c.Scope); ok && !c.Delivered() && len(c.DeliveredFields) == 0 && len(c.LastDeliveredFields) == 0 && c.DeliveredRev == "" {
+			// A re-grant that says nothing about deliveries keeps the
+			// delivery bookkeeping.
+			c.DeliveredAt, c.FirstDeliveredAt = have.DeliveredAt, have.FirstDeliveredAt
+			c.DeliveredFields, c.LastDeliveredFields, c.DeliveredRev = have.DeliveredFields, have.LastDeliveredFields, have.DeliveredRev
+		}
 		setConsent(p, c)
 		return true, nil
 	})
 }
 
+// DeleteConsent removes the consent record for scope, delivery bookkeeping
+// included. It reports whether there was one.
+func (s *Store) DeleteConsent(id, scope string) (bool, error) {
+	var removed bool
+	err := s.update(id, func(_ *bolt.Tx, p *Person) (bool, error) {
+		before := len(p.Consents)
+		p.Consents = slices.DeleteFunc(p.Consents, func(c Consent) bool { return c.Scope == scope })
+		removed = len(p.Consents) != before
+		return removed, nil
+	})
+	return removed, err
+}
+
 func checkConsent(c Consent) error {
-	if err := checkText("consent scope", c.Scope, maxIDBytes, true); err != nil {
+	if err := checkText("consent scope", c.Scope, MaxIDBytes, true); err != nil {
 		return err
 	}
 	if len(c.Fields) > maxConsentFields {
 		return invalid("consent lists more than %d fields", maxConsentFields)
 	}
-	for _, f := range c.Fields {
-		if err := checkText("consent field", f, maxFieldBytes, true); err != nil {
-			return err
+	for _, list := range [][]string{c.Fields, c.DeliveredFields, c.LastDeliveredFields} {
+		if len(list) > maxConsentFields {
+			return invalid("consent lists more than %d fields", maxConsentFields)
 		}
+		for _, f := range list {
+			if err := checkText("consent field", f, maxFieldBytes, true); err != nil {
+				return err
+			}
+		}
+	}
+	if err := checkText("consent delivered rev", c.DeliveredRev, maxSourceBytes, false); err != nil {
+		return err
 	}
 	return checkText("consent text version", c.TextVersion, maxSourceBytes, false)
 }
 
 func setConsent(p *Person, c Consent) {
 	c.Fields = slices.Clone(c.Fields)
+	c.DeliveredFields = slices.Clone(c.DeliveredFields)
+	c.LastDeliveredFields = slices.Clone(c.LastDeliveredFields)
 	for i := range p.Consents {
 		if p.Consents[i].Scope == c.Scope {
 			p.Consents[i] = c
@@ -688,12 +806,58 @@ func setConsent(p *Person, c Consent) {
 
 // WithdrawConsent stamps the consent for scope as withdrawn now.
 func (s *Store) WithdrawConsent(id, scope string) error {
-	return s.updateConsent(id, scope, func(c *Consent) { c.WithdrawnAt = s.now().UTC() })
+	return s.updateConsent(id, scope, func(c *Consent) {
+		now := s.now().UTC()
+		c.WithdrawnAt, c.UpdatedAt = now, now
+	})
 }
 
-// MarkConsentDelivered stamps the consent for scope as delivered now.
+// MarkConsentDelivered stamps the consent for scope as delivered now. Use
+// RecordDelivery to also record what was delivered.
 func (s *Store) MarkConsentDelivered(id, scope string) error {
-	return s.updateConsent(id, scope, func(c *Consent) { c.DeliveredAt = s.now().UTC() })
+	return s.updateConsent(id, scope, func(c *Consent) {
+		c.DeliveredAt = s.now().UTC()
+		if c.FirstDeliveredAt.IsZero() {
+			c.FirstDeliveredAt = c.DeliveredAt
+		}
+	})
+}
+
+// RecordDelivery records one delivery under the consent for scope: the time
+// (the first delivery is kept as FirstDeliveredAt), the fields it carried
+// (added to DeliveredFields, and kept as LastDeliveredFields) and its
+// revision.
+func (s *Store) RecordDelivery(id, scope string, d Delivery) error {
+	if len(d.Fields) > maxConsentFields {
+		return invalid("delivery lists more than %d fields", maxConsentFields)
+	}
+	for _, f := range d.Fields {
+		if err := checkText("delivered field", f, maxFieldBytes, true); err != nil {
+			return err
+		}
+	}
+	if err := checkText("delivered rev", d.Rev, maxSourceBytes, false); err != nil {
+		return err
+	}
+	at := d.At.UTC()
+	if d.At.IsZero() {
+		at = s.now().UTC()
+	}
+	return s.updateConsent(id, scope, func(c *Consent) {
+		c.DeliveredAt = at
+		if c.FirstDeliveredAt.IsZero() {
+			c.FirstDeliveredAt = at
+		}
+		for _, f := range d.Fields {
+			// Bounded like every field list, so the record always passes
+			// checkConsent on a restore.
+			if !slices.Contains(c.DeliveredFields, f) && len(c.DeliveredFields) < maxConsentFields {
+				c.DeliveredFields = append(c.DeliveredFields, f)
+			}
+		}
+		c.LastDeliveredFields = slices.Clone(d.Fields)
+		c.DeliveredRev = d.Rev
+	})
 }
 
 func (s *Store) updateConsent(id, scope string, fn func(*Consent)) error {
@@ -719,61 +883,118 @@ func (s *Store) updateConsent(id, scope string, fn func(*Consent)) error {
 func (s *Store) Forget(id string) (int, error) {
 	n := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		p, ok, err := loadPerson(tx, id)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return ErrNotFound
-		}
-		for _, ident := range p.Identities {
-			if err := s.tombstoneTx(tx, ident.Ref()); err != nil {
-				return err
-			}
-			if err := tx.Bucket(bucketIdentities).Delete(indexKey(ident.Ref())); err != nil {
-				return err
-			}
-			n++
-		}
-		if err := tx.Bucket(bucketTombstones).Put(personTombstoneKey(tx, id), s.stamp()); err != nil {
-			return err
-		}
-		return tx.Bucket(bucketPeople).Delete([]byte(id))
+		var err error
+		n, err = s.forgetTx(tx, id)
+		return err
 	})
 	return n, err
 }
 
+func (s *Store) forgetTx(tx *bolt.Tx, id string) (int, error) {
+	p, ok, err := loadPerson(tx, id)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, ErrNotFound
+	}
+	n := 0
+	for _, ident := range p.Identities {
+		if err := s.tombstoneTx(tx, ident.Ref()); err != nil {
+			return 0, err
+		}
+		// Nobody keeps a forgotten identity, held or not.
+		if err := s.dropHoldersTx(tx, ident.Ref()); err != nil {
+			return 0, err
+		}
+		if err := tx.Bucket(bucketIdentities).Delete(indexKey(ident.Ref())); err != nil {
+			return 0, err
+		}
+		n++
+	}
+	// A held identity belongs to its owner, so it is not tombstoned: only
+	// this person's claim to it goes.
+	for _, h := range p.Held {
+		if err := heldIndexRemove(tx, h.Ref(), id); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Bucket(bucketTombstones).Put(personTombstoneKey(tx, id), s.stamp()); err != nil {
+		return 0, err
+	}
+	return n, tx.Bucket(bucketPeople).Delete([]byte(id))
+}
+
 // ForgetIdentity tombstones one identity, whether or not anyone holds it. A
-// person holding it loses the identity and every fact derived from it.
+// person holding it loses the identity and every fact derived from it, and
+// every person holding it as a HeldIdentity loses that.
 func (s *Store) ForgetIdentity(ref IdentityRef) error {
 	if err := checkRef(ref); err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		if err := s.tombstoneTx(tx, ref); err != nil {
+	return s.db.Update(func(tx *bolt.Tx) error { return s.forgetIdentityTx(tx, ref) })
+}
+
+// forgetIdentityTx is ForgetIdentity inside tx.
+func (s *Store) forgetIdentityTx(tx *bolt.Tx, ref IdentityRef) error {
+	if err := s.tombstoneTx(tx, ref); err != nil {
+		return err
+	}
+	if err := s.dropHoldersTx(tx, ref); err != nil {
+		return err
+	}
+	index := tx.Bucket(bucketIdentities)
+	owner := index.Get(indexKey(ref))
+	if owner == nil {
+		return nil
+	}
+	id := string(owner)
+	if err := index.Delete(indexKey(ref)); err != nil {
+		return err
+	}
+	p, ok, err := loadPerson(tx, id)
+	if err != nil || !ok {
+		return err
+	}
+	removeIdentity(&p, ref)
+	dropDerived(&p, ref)
+	p.UpdatedAt = s.now().UTC()
+	return putPerson(tx, p)
+}
+
+// dropHoldersTx removes a forgotten identity from everyone holding it, with
+// every fact they derived from it, and drops its held-index entry.
+func (s *Store) dropHoldersTx(tx *bolt.Tx, ref IdentityRef) error {
+	holders, err := heldIndexList(tx, ref)
+	if err != nil {
+		return err
+	}
+	for _, holder := range holders {
+		hp, ok, err := loadPerson(tx, holder)
+		if err != nil {
 			return err
 		}
-		index := tx.Bucket(bucketIdentities)
-		owner := index.Get(indexKey(ref))
-		if owner == nil {
-			return nil
+		if !ok {
+			continue
 		}
-		id := string(owner)
-		if err := index.Delete(indexKey(ref)); err != nil {
+		if err := dropHeldTx(tx, &hp, ref); err != nil {
 			return err
 		}
-		p, ok, err := loadPerson(tx, id)
-		if err != nil || !ok {
+		dropDerived(&hp, ref)
+		hp.UpdatedAt = s.now().UTC()
+		if err := putPerson(tx, hp); err != nil {
 			return err
 		}
-		removeIdentity(&p, ref)
-		p.Facts = slices.DeleteFunc(p.Facts, func(f Fact) bool {
-			return slices.ContainsFunc(f.DerivedFrom, func(d IdentityRef) bool {
-				return identityClass(d.Kind) == identityClass(ref.Kind) && d.Value == normalizeValue(ref.Kind, ref.Value)
-			})
+	}
+	return tx.Bucket(bucketHeld).Delete(indexKey(ref))
+}
+
+// dropDerived removes every fact of p derived from ref.
+func dropDerived(p *Person, ref IdentityRef) {
+	p.Facts = slices.DeleteFunc(p.Facts, func(f Fact) bool {
+		return slices.ContainsFunc(f.DerivedFrom, func(d IdentityRef) bool {
+			return identityClass(d.Kind) == identityClass(ref.Kind) && d.Value == normalizeValue(ref.Kind, ref.Value)
 		})
-		p.UpdatedAt = s.now().UTC()
-		return putPerson(tx, p)
 	})
 }
 
@@ -826,6 +1047,11 @@ type Stats struct {
 	Suggestions int          `json:"suggestions"`
 	Consents    int          `json:"consents"`
 	Tombstones  int          `json:"tombstones"`
+	// Held counts held identities, Answers provider answers, and
+	// Attachments the people that carry at least one attachment.
+	Held        int `json:"held"`
+	Answers     int `json:"answers"`
+	Attachments int `json:"attachments"`
 }
 
 // Stats returns the counts.
@@ -841,6 +1067,11 @@ func (s *Store) Stats() (Stats, error) {
 			st.People++
 			st.Identities += len(p.Identities)
 			st.Consents += len(p.Consents)
+			st.Held += len(p.Held)
+			st.Answers += len(p.Answers)
+			if len(p.Attachments) > 0 {
+				st.Attachments++
+			}
 			for _, f := range p.Facts {
 				st.Facts[f.Rank]++
 				if f.Suggested {
