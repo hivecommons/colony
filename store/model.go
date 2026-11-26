@@ -222,7 +222,8 @@ type Identity struct {
 type HeldIdentity struct {
 	Identity
 	// Owner is the person that owned the identity when it was held, or
-	// empty when nobody did.
+	// empty when nobody did. It is a snapshot: Contested reads the live
+	// owner from the identity index.
 	Owner string `json:"owner,omitempty"`
 }
 
@@ -282,7 +283,9 @@ type Consent struct {
 	TextVersion string    `json:"text_version,omitempty"`
 	GrantedAt   time.Time `json:"granted_at,omitzero"`
 	WithdrawnAt time.Time `json:"withdrawn_at,omitzero"`
-	// UpdatedAt is when the record last changed.
+	// UpdatedAt is when the grant last changed (SetConsent stamps it when
+	// the caller leaves it zero, WithdrawConsent always). A delivery does
+	// not change it; the delivery fields below record those.
 	UpdatedAt time.Time `json:"updated_at,omitzero"`
 	// Delivery bookkeeping, written by RecordDelivery: DeliveredAt is the
 	// last delivery and FirstDeliveredAt the first; DeliveredFields is every
@@ -545,6 +548,9 @@ func checkTextAllowing(what, s string, maxBytes int, required, cr bool) error {
 	return nil
 }
 
+// maxAnswersBytes bounds the encoded answers of one person.
+const maxAnswersBytes = 256 << 10
+
 // ValueLimit is the most bytes a value of field may hold: MaxNotesBytes for
 // FieldNotes, MaxValueBytes for every other field.
 func ValueLimit(field string) int {
@@ -556,9 +562,10 @@ func ValueLimit(field string) int {
 
 // CheckFactValue reports whether SetFact would accept value for field: valid
 // UTF-8, at most ValueLimit(field) bytes, and no control character other
-// than newline, tab and carriage return. It wraps ErrInvalid.
+// than newline and tab (and, in FieldNotes, carriage return: pasted free
+// text). It wraps ErrInvalid.
 func CheckFactValue(field, value string) error {
-	return checkTextAllowing("fact value", value, ValueLimit(field), false, true)
+	return checkTextAllowing("fact value", value, ValueLimit(field), false, canonicalField(field) == FieldNotes)
 }
 
 func checkID(id string) error { return checkText("person id", id, MaxIDBytes, true) }

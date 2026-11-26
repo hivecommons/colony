@@ -373,7 +373,7 @@ func (s *Store) importRecord(tx *bolt.Tx, r Record, rep *ImportReport) error {
 		if err := checkRef(ref); err != nil {
 			return err
 		}
-		if err := s.tombstoneTx(tx, ref); err != nil {
+		if err := s.forgetIdentityTx(tx, ref); err != nil {
 			return err
 		}
 		rep.Tombstones++

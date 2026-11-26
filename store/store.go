@@ -308,7 +308,9 @@ type PersonSpec struct {
 // Upsert creates the person or adds identities to it. An identity that
 // another person owns fails with ErrIdentityConflict, unless
 // spec.HoldConflicts is set, and a forgotten one with ErrTombstoned; either
-// way nothing is written.
+// way nothing is written. Without an id, the person is the owner of the
+// first identity someone owns (so with HoldConflicts the rest are held
+// there); a claimant should pass its own id.
 func (s *Store) Upsert(spec PersonSpec) (Person, error) {
 	var p Person
 	err := s.db.Update(func(tx *bolt.Tx) error {
@@ -742,6 +744,12 @@ func (s *Store) SetConsent(id string, c Consent) error {
 		c.UpdatedAt = s.now().UTC()
 	}
 	return s.update(id, func(_ *bolt.Tx, p *Person) (bool, error) {
+		if have, ok := p.Consent(c.Scope); ok && !c.Delivered() && len(c.DeliveredFields) == 0 && len(c.LastDeliveredFields) == 0 && c.DeliveredRev == "" {
+			// A re-grant that says nothing about deliveries keeps the
+			// delivery bookkeeping.
+			c.DeliveredAt, c.FirstDeliveredAt = have.DeliveredAt, have.FirstDeliveredAt
+			c.DeliveredFields, c.LastDeliveredFields, c.DeliveredRev = have.DeliveredFields, have.LastDeliveredFields, have.DeliveredRev
+		}
 		setConsent(p, c)
 		return true, nil
 	})
@@ -841,7 +849,9 @@ func (s *Store) RecordDelivery(id, scope string, d Delivery) error {
 			c.FirstDeliveredAt = at
 		}
 		for _, f := range d.Fields {
-			if !slices.Contains(c.DeliveredFields, f) {
+			// Bounded like every field list, so the record always passes
+			// checkConsent on a restore.
+			if !slices.Contains(c.DeliveredFields, f) && len(c.DeliveredFields) < maxConsentFields {
 				c.DeliveredFields = append(c.DeliveredFields, f)
 			}
 		}
@@ -893,6 +903,10 @@ func (s *Store) forgetTx(tx *bolt.Tx, id string) (int, error) {
 		if err := s.tombstoneTx(tx, ident.Ref()); err != nil {
 			return 0, err
 		}
+		// Nobody keeps a forgotten identity, held or not.
+		if err := s.dropHoldersTx(tx, ident.Ref()); err != nil {
+			return 0, err
+		}
 		if err := tx.Bucket(bucketIdentities).Delete(indexKey(ident.Ref())); err != nil {
 			return 0, err
 		}
@@ -918,49 +932,69 @@ func (s *Store) ForgetIdentity(ref IdentityRef) error {
 	if err := checkRef(ref); err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		if err := s.tombstoneTx(tx, ref); err != nil {
+	return s.db.Update(func(tx *bolt.Tx) error { return s.forgetIdentityTx(tx, ref) })
+}
+
+// forgetIdentityTx is ForgetIdentity inside tx.
+func (s *Store) forgetIdentityTx(tx *bolt.Tx, ref IdentityRef) error {
+	if err := s.tombstoneTx(tx, ref); err != nil {
+		return err
+	}
+	if err := s.dropHoldersTx(tx, ref); err != nil {
+		return err
+	}
+	index := tx.Bucket(bucketIdentities)
+	owner := index.Get(indexKey(ref))
+	if owner == nil {
+		return nil
+	}
+	id := string(owner)
+	if err := index.Delete(indexKey(ref)); err != nil {
+		return err
+	}
+	p, ok, err := loadPerson(tx, id)
+	if err != nil || !ok {
+		return err
+	}
+	removeIdentity(&p, ref)
+	dropDerived(&p, ref)
+	p.UpdatedAt = s.now().UTC()
+	return putPerson(tx, p)
+}
+
+// dropHoldersTx removes a forgotten identity from everyone holding it, with
+// every fact they derived from it, and drops its held-index entry.
+func (s *Store) dropHoldersTx(tx *bolt.Tx, ref IdentityRef) error {
+	holders, err := heldIndexList(tx, ref)
+	if err != nil {
+		return err
+	}
+	for _, holder := range holders {
+		hp, ok, err := loadPerson(tx, holder)
+		if err != nil {
 			return err
 		}
-		for _, holder := range heldIndexList(tx, ref) {
-			hp, ok, err := loadPerson(tx, holder)
-			if err != nil {
-				return err
-			}
-			if ok {
-				if err := dropHeldTx(tx, &hp, ref); err != nil {
-					return err
-				}
-				hp.UpdatedAt = s.now().UTC()
-				if err := putPerson(tx, hp); err != nil {
-					return err
-				}
-			}
+		if !ok {
+			continue
 		}
-		if err := tx.Bucket(bucketHeld).Delete(indexKey(ref)); err != nil {
+		if err := dropHeldTx(tx, &hp, ref); err != nil {
 			return err
 		}
-		index := tx.Bucket(bucketIdentities)
-		owner := index.Get(indexKey(ref))
-		if owner == nil {
-			return nil
-		}
-		id := string(owner)
-		if err := index.Delete(indexKey(ref)); err != nil {
+		dropDerived(&hp, ref)
+		hp.UpdatedAt = s.now().UTC()
+		if err := putPerson(tx, hp); err != nil {
 			return err
 		}
-		p, ok, err := loadPerson(tx, id)
-		if err != nil || !ok {
-			return err
-		}
-		removeIdentity(&p, ref)
-		p.Facts = slices.DeleteFunc(p.Facts, func(f Fact) bool {
-			return slices.ContainsFunc(f.DerivedFrom, func(d IdentityRef) bool {
-				return identityClass(d.Kind) == identityClass(ref.Kind) && d.Value == normalizeValue(ref.Kind, ref.Value)
-			})
+	}
+	return tx.Bucket(bucketHeld).Delete(indexKey(ref))
+}
+
+// dropDerived removes every fact of p derived from ref.
+func dropDerived(p *Person, ref IdentityRef) {
+	p.Facts = slices.DeleteFunc(p.Facts, func(f Fact) bool {
+		return slices.ContainsFunc(f.DerivedFrom, func(d IdentityRef) bool {
+			return identityClass(d.Kind) == identityClass(ref.Kind) && d.Value == normalizeValue(ref.Kind, ref.Value)
 		})
-		p.UpdatedAt = s.now().UTC()
-		return putPerson(tx, p)
 	})
 }
 

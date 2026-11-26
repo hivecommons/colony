@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"slices"
@@ -526,8 +527,8 @@ func TestLongValues(t *testing.T) {
 	if err := CheckFactValue(FieldOrganization, "a\x00b"); !errors.Is(err, ErrInvalid) {
 		t.Errorf("NUL: err = %v, want ErrInvalid", err)
 	}
-	if err := CheckFactValue(FieldOrganization, "a\rb"); err != nil {
-		t.Errorf("carriage return: err = %v", err)
+	if err := CheckFactValue(FieldOrganization, "a\rb"); !errors.Is(err, ErrInvalid) {
+		t.Errorf("carriage return outside notes: err = %v, want ErrInvalid", err)
 	}
 }
 
@@ -592,5 +593,85 @@ func TestStatsCountsNewSlots(t *testing.T) {
 	}
 	if st.Held != 1 || st.Answers != 1 || st.Attachments != 1 || st.Identities != 1 {
 		t.Errorf("stats = %+v", st)
+	}
+}
+
+func TestForgetOwnerDropsHolders(t *testing.T) {
+	s := openTest(t)
+	mustUpsert(t, s, PersonSpec{ID: "owner", Identities: []Identity{githubIdentity(loginA)}})
+	mustUpsert(t, s, PersonSpec{ID: "holder", Identities: []Identity{githubIdentity(loginB)}, Held: []Identity{githubIdentity(loginA)}})
+	derived := fact(FieldAffiliation, "Org", RankEnrichment)
+	derived.DerivedFrom = []IdentityRef{{Kind: KindGitHub, Value: loginA}}
+	mustSet(t, s, "holder", derived)
+
+	if _, err := s.Forget("owner"); err != nil {
+		t.Fatal(err)
+	}
+	h := mustGet(t, s, "holder")
+	if len(h.Held) != 0 {
+		t.Errorf("a holder keeps the forgotten owner's identity: %+v", h.Held)
+	}
+	if _, ok := h.FactAt(FieldAffiliation, RankEnrichment); ok {
+		t.Error("a fact derived from the forgotten identity survived on the holder")
+	}
+	if c, _ := s.Contested(IdentityRef{Kind: KindGitHub, Value: loginA}); c.Owner != "" || len(c.Holders) != 0 {
+		t.Errorf("Contested after forgetting the owner = %+v", c)
+	}
+}
+
+func TestBatchNeverCommitsAfterAFailedWrite(t *testing.T) {
+	s := openTest(t)
+	mustUpsert(t, s, PersonSpec{ID: "p1", Identities: []Identity{githubIdentity(loginA)}})
+	err := s.Batch(func(b *Batch) error {
+		// The caller swallows the error and carries on.
+		_, _ = b.Replace(Record{Person: PersonSpec{ID: "p1", Identities: []Identity{githubIdentity(loginB)}},
+			Facts: []Fact{fact(FieldOrganization, "x", RankUser), fact(FieldOrganization, "y", RankUser)}})
+		_, _ = b.Forget("missing") // ErrNotFound changes nothing and does not count
+		return nil
+	})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Batch = %v, want the failed write's ErrInvalid", err)
+	}
+	if owner, err := s.FindByIdentity(KindGitHub, loginA); err != nil || owner.ID != "p1" {
+		t.Errorf("after a failed batch loginA resolves to %q, %v", owner.ID, err)
+	}
+	if _, err := s.FindByIdentity(KindGitHub, loginB); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a failed batch indexed loginB: %v", err)
+	}
+	if err := s.Batch(func(b *Batch) error { _, err := b.Forget("missing"); _ = err; return nil }); err != nil {
+		t.Errorf("a not-found forget failed the batch: %v", err)
+	}
+}
+
+func TestDeliveryBookkeepingIsBoundedAndKept(t *testing.T) {
+	s := openTest(t)
+	mustUpsert(t, s, PersonSpec{ID: "p1"})
+	if err := s.SetConsent("p1", Consent{Scope: testScope, Fields: []string{FieldCountry}, GrantedAt: testBase}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxConsentFields+5; i++ {
+		f := fmt.Sprintf("field_%d", i)
+		if err := s.RecordDelivery("p1", testScope, Delivery{Fields: []string{f}, Rev: "r"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, _ := mustGet(t, s, "p1").Consent(testScope)
+	if len(c.DeliveredFields) != maxConsentFields {
+		t.Errorf("delivered fields = %d, want capped at %d", len(c.DeliveredFields), maxConsentFields)
+	}
+	// The record still restores.
+	full, err := s.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openTest(t).Import(context.Background(), full); err != nil {
+		t.Errorf("restoring a record with many deliveries: %v", err)
+	}
+	// A re-grant that names no delivery keeps the bookkeeping.
+	if err := s.SetConsent("p1", Consent{Scope: testScope, Fields: []string{FieldCountry, FieldRealName}, GrantedAt: testNow}); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := mustGet(t, s, "p1").Consent(testScope); !c.Delivered() || c.DeliveredRev != "r" || len(c.DeliveredFields) == 0 {
+		t.Errorf("a re-grant wiped the delivery bookkeeping: %+v", c)
 	}
 }

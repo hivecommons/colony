@@ -5,6 +5,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -39,8 +40,9 @@ func (s *Store) Contested(ref IdentityRef) (Contest, error) {
 	var c Contest
 	err := s.db.View(func(tx *bolt.Tx) error {
 		c.Owner = string(tx.Bucket(bucketIdentities).Get(indexKey(ref)))
-		c.Holders = heldIndexList(tx, ref)
-		return nil
+		var err error
+		c.Holders, err = heldIndexList(tx, ref)
+		return err
 	})
 	return c, err
 }
@@ -97,16 +99,16 @@ func dropHeldTx(tx *bolt.Tx, p *Person, ref IdentityRef) error {
 	return heldIndexRemove(tx, ref, p.ID)
 }
 
-func heldIndexList(tx *bolt.Tx, ref IdentityRef) []string {
+func heldIndexList(tx *bolt.Tx, ref IdentityRef) ([]string, error) {
 	raw := tx.Bucket(bucketHeld).Get(indexKey(ref))
 	if raw == nil {
-		return nil
+		return nil, nil
 	}
 	var ids []string
-	if json.Unmarshal(raw, &ids) != nil {
-		return nil
+	if err := json.Unmarshal(raw, &ids); err != nil {
+		return nil, fmt.Errorf("store: decode held index: %w", err)
 	}
-	return ids
+	return ids, nil
 }
 
 func heldIndexPut(tx *bolt.Tx, ref IdentityRef, ids []string) error {
@@ -122,7 +124,10 @@ func heldIndexPut(tx *bolt.Tx, ref IdentityRef, ids []string) error {
 }
 
 func heldIndexAdd(tx *bolt.Tx, ref IdentityRef, id string) error {
-	ids := heldIndexList(tx, ref)
+	ids, err := heldIndexList(tx, ref)
+	if err != nil {
+		return err
+	}
 	if slices.Contains(ids, id) {
 		return nil
 	}
@@ -130,7 +135,10 @@ func heldIndexAdd(tx *bolt.Tx, ref IdentityRef, id string) error {
 }
 
 func heldIndexRemove(tx *bolt.Tx, ref IdentityRef, id string) error {
-	ids := heldIndexList(tx, ref)
+	ids, err := heldIndexList(tx, ref)
+	if err != nil {
+		return err
+	}
 	if !slices.Contains(ids, id) {
 		return nil
 	}
@@ -168,19 +176,30 @@ func (s *Store) DeleteAnswer(id, source string) error {
 }
 
 func setAnswer(p *Person, a Answer) (bool, error) {
+	replaced := false
 	for i := range p.Answers {
 		if p.Answers[i].Source == a.Source {
 			if a.FetchedAt.Before(p.Answers[i].FetchedAt) {
 				return false, nil
 			}
 			p.Answers[i] = a
-			return true, nil
+			replaced = true
+			break
 		}
 	}
-	if len(p.Answers) >= maxAnswers {
-		return false, invalid("more than %d answers", maxAnswers)
+	if !replaced {
+		if len(p.Answers) >= maxAnswers {
+			return false, invalid("more than %d answers", maxAnswers)
+		}
+		p.Answers = append(p.Answers, a)
 	}
-	p.Answers = append(p.Answers, a)
+	raw, err := json.Marshal(p.Answers)
+	if err != nil {
+		return false, err
+	}
+	if len(raw) > maxAnswersBytes {
+		return false, invalid("answers are larger than %d bytes", maxAnswersBytes)
+	}
 	return true, nil
 }
 
@@ -381,7 +400,7 @@ func (s *Store) replaceTx(tx *bolt.Tx, rec Record) (ReplaceReport, error) {
 		if err := checkRef(ref); err != nil {
 			return rep, err
 		}
-		if err := s.tombstoneTx(tx, ref); err != nil {
+		if err := s.forgetIdentityTx(tx, ref); err != nil {
 			return rep, err
 		}
 	}
@@ -566,12 +585,33 @@ func checkDismissal(d Dismissal) error {
 type Batch struct {
 	s  *Store
 	tx *bolt.Tx
+	// failed is the first write that failed. A failed write may have
+	// touched the indexes before it stopped, so the batch never commits
+	// after one, even when fn carries on and returns nil.
+	failed error
 }
 
 // Batch runs fn in one write transaction. fn must not call back into the
-// Store itself, only into the Batch.
+// Store itself, only into the Batch. When any write in the batch fails,
+// nothing is written, whatever fn returns: Batch returns fn's error, or the
+// first failed write's.
 func (s *Store) Batch(fn func(b *Batch) error) error {
-	return s.db.Update(func(tx *bolt.Tx) error { return fn(&Batch{s: s, tx: tx}) })
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := &Batch{s: s, tx: tx}
+		if err := fn(b); err != nil {
+			return err
+		}
+		return b.failed
+	})
+}
+
+// note records the first failed write. ErrNotFound is not one: the write
+// found no person and changed nothing.
+func (b *Batch) note(err error) error {
+	if err != nil && !errors.Is(err, ErrNotFound) && b.failed == nil {
+		b.failed = err
+	}
+	return err
 }
 
 // Get returns the person with id as the batch sees it, or ErrNotFound.
@@ -584,16 +624,29 @@ func (b *Batch) Get(id string) (Person, error) {
 }
 
 // Replace is Store.Replace inside the batch.
-func (b *Batch) Replace(rec Record) (ReplaceReport, error) { return b.s.replaceTx(b.tx, rec) }
+func (b *Batch) Replace(rec Record) (ReplaceReport, error) {
+	rep, err := b.s.replaceTx(b.tx, rec)
+	return rep, b.note(err)
+}
 
 // Upsert is Store.Upsert inside the batch.
-func (b *Batch) Upsert(spec PersonSpec) (Person, error) { return b.s.upsertTx(b.tx, spec) }
+func (b *Batch) Upsert(spec PersonSpec) (Person, error) {
+	p, err := b.s.upsertTx(b.tx, spec)
+	return p, b.note(err)
+}
 
 // Forget is Store.Forget inside the batch.
-func (b *Batch) Forget(id string) (int, error) { return b.s.forgetTx(b.tx, id) }
+func (b *Batch) Forget(id string) (int, error) {
+	n, err := b.s.forgetTx(b.tx, id)
+	return n, b.note(err)
+}
 
 // RemoveIdentity is Store.RemoveIdentity inside the batch.
 func (b *Batch) RemoveIdentity(id string, ref IdentityRef) error {
+	return b.note(b.removeIdentity(id, ref))
+}
+
+func (b *Batch) removeIdentity(id string, ref IdentityRef) error {
 	if err := checkRef(ref); err != nil {
 		return err
 	}
@@ -616,11 +669,15 @@ func (b *Batch) RemoveIdentity(id string, ref IdentityRef) error {
 
 // SetStoreAttachment is Store.SetStoreAttachment inside the batch.
 func (b *Batch) SetStoreAttachment(ns string, data json.RawMessage) error {
-	return setStoreAttachmentTx(b.tx, ns, data)
+	return b.note(setStoreAttachmentTx(b.tx, ns, data))
 }
 
 // SetAttachment is Store.SetAttachment inside the batch.
 func (b *Batch) SetAttachment(id, ns string, data json.RawMessage) error {
+	return b.note(b.setAttachment(id, ns, data))
+}
+
+func (b *Batch) setAttachment(id, ns string, data json.RawMessage) error {
 	if err := checkAttachment(ns, data); err != nil {
 		return err
 	}
