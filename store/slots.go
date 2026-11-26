@@ -618,3 +618,22 @@ func (b *Batch) RemoveIdentity(id string, ref IdentityRef) error {
 func (b *Batch) SetStoreAttachment(ns string, data json.RawMessage) error {
 	return setStoreAttachmentTx(b.tx, ns, data)
 }
+
+// SetAttachment is Store.SetAttachment inside the batch.
+func (b *Batch) SetAttachment(id, ns string, data json.RawMessage) error {
+	if err := checkAttachment(ns, data); err != nil {
+		return err
+	}
+	p, ok, err := loadPerson(b.tx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNotFound
+	}
+	if err := setAttachment(&p, ns, data); err != nil {
+		return err
+	}
+	p.UpdatedAt = b.s.now().UTC()
+	return putPerson(b.tx, p)
+}

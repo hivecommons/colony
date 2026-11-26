@@ -311,6 +311,12 @@ func TestBatchIsAtomic(t *testing.T) {
 		if err := b.RemoveIdentity("p2", IdentityRef{Kind: KindGitHub, Value: loginB}); err != nil {
 			return err
 		}
+		if err := b.SetAttachment("p2", "consumer", json.RawMessage(`{"a":2}`)); err != nil {
+			return err
+		}
+		if err := b.SetAttachment("missing", "consumer", json.RawMessage(`{}`)); !errors.Is(err, ErrNotFound) {
+			return errors.New("attachment on a missing person did not fail")
+		}
 		_, err = b.Forget("p1")
 		return err
 	})
@@ -320,8 +326,8 @@ func TestBatchIsAtomic(t *testing.T) {
 	if _, err := s.Get("p1"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("forgotten in a batch: %v", err)
 	}
-	if got := mustGet(t, s, "p2"); len(got.Identities) != 0 {
-		t.Errorf("identity removed in a batch is still held: %+v", got.Identities)
+	if got := mustGet(t, s, "p2"); len(got.Identities) != 0 || string(got.Attachments["consumer"]) != `{"a":2}` {
+		t.Errorf("after the batch p2 = %+v", got)
 	}
 }
 
