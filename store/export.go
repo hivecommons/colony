@@ -23,6 +23,9 @@ type Snapshot struct {
 	// in an unfiltered export, together with the salt they were made with.
 	Tombstones    []string `json:"tombstones,omitempty"`
 	TombstoneSalt string   `json:"tombstone_salt,omitempty"`
+	// Attachments are the store-level attachments (SetStoreAttachment). They
+	// are only in an unfiltered export.
+	Attachments map[string]json.RawMessage `json:"attachments,omitempty"`
 }
 
 // Filter narrows one person in an export. It returns the narrowed person,
@@ -38,7 +41,8 @@ type Filter func(Person) (Person, bool)
 //     bare clear, and a local_only value hides every weaker rank, so the
 //     receiver never sees a value the person cleared or overrode;
 //   - never ConsentFirstFields (use ShareableFor for a consented scope);
-//   - never consents, dismissals, or who set a value (By, AcceptedBy).
+//   - never consents, dismissals, or who set a value (By, AcceptedBy);
+//   - never held identities, provider answers or attachments.
 //
 // The person id is exported as is, so consumers must use opaque ids.
 func Shareable() Filter {
@@ -62,6 +66,7 @@ func shareableView(p Person, consent Consent) Person {
 	out := Person{ID: p.ID, Status: p.Status, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt}
 	for _, i := range p.Identities {
 		if i.Locality == LocalityShareable && !i.Kind.IsEmail() {
+			i.By = ""
 			out.Identities = append(out.Identities, i)
 		}
 	}
@@ -133,6 +138,7 @@ func (s *Store) Export(filters ...Filter) (Snapshot, error) {
 			return err
 		}
 		snap.TombstoneSalt = hex.EncodeToString(tx.Bucket(bucketMeta).Get(keySalt))
+		snap.Attachments = storeAttachmentsTx(tx)
 		return tx.Bucket(bucketTombstones).ForEach(func(k, _ []byte) error {
 			snap.Tombstones = append(snap.Tombstones, string(k))
 			return nil
@@ -174,16 +180,32 @@ func (s *Store) Import(ctx context.Context, snap Snapshot) (ImportReport, error)
 			}
 			rep.Tombstones = len(snap.Tombstones)
 		}
+		names := make([]string, 0, len(snap.Attachments))
+		for ns := range snap.Attachments {
+			names = append(names, ns)
+		}
+		slices.Sort(names)
+		for _, ns := range names {
+			if err := setStoreAttachmentTx(tx, ns, snap.Attachments[ns]); err != nil {
+				return err
+			}
+		}
 		for _, p := range snap.People {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			var held []Identity
+			for _, h := range p.Held {
+				held = append(held, h.Identity)
+			}
 			r := Record{
-				Person:    PersonSpec{ID: p.ID, Status: p.Status, Identities: p.Identities},
-				Facts:     p.Facts,
-				Consents:  p.Consents,
-				Dismissed: p.Dismissed,
-				CreatedAt: p.CreatedAt,
+				Person:      PersonSpec{ID: p.ID, Status: p.Status, Identities: p.Identities, Held: held},
+				Facts:       p.Facts,
+				Consents:    p.Consents,
+				Dismissed:   p.Dismissed,
+				Answers:     p.Answers,
+				Attachments: p.Attachments,
+				CreatedAt:   p.CreatedAt,
 			}
 			if err := s.importRecord(tx, r, &rep); err != nil {
 				return err
@@ -231,6 +253,11 @@ type Record struct {
 	Facts     []Fact      `json:"facts,omitempty"`
 	Consents  []Consent   `json:"consents,omitempty"`
 	Dismissed []Dismissal `json:"dismissed,omitempty"`
+	// Answers are provider answers, merged by source (the newer wins).
+	Answers []Answer `json:"answers,omitempty"`
+	// Attachments are consumer data by namespace; each replaces the stored
+	// one.
+	Attachments map[string]json.RawMessage `json:"attachments,omitempty"`
 	// Forgotten lists identities the legacy store tombstoned. They are
 	// tombstoned here too.
 	Forgotten []IdentityRef `json:"forgotten,omitempty"`
@@ -352,8 +379,22 @@ func (s *Store) importRecord(tx *bolt.Tx, r Record, rep *ImportReport) error {
 		rep.Tombstones++
 	}
 	spec := r.Person
-	spec.Identities = nil
+	spec.Identities, spec.Held = nil, nil
 	var skipped []IdentityRef
+	for _, ident := range r.Person.Held {
+		if err := checkRef(ident.Ref()); err != nil {
+			return err
+		}
+		tomb, err := s.tombstonedTx(tx, ident.Ref())
+		if err != nil {
+			return err
+		}
+		if tomb {
+			rep.SkippedIdentities++
+			continue
+		}
+		spec.Held = append(spec.Held, ident)
+	}
 	for _, ident := range r.Person.Identities {
 		if err := checkRef(ident.Ref()); err != nil {
 			return err
@@ -388,13 +429,7 @@ func (s *Store) importRecord(tx *bolt.Tx, r Record, rep *ImportReport) error {
 		p.CreatedAt = r.CreatedAt.UTC()
 	}
 	for _, d := range r.Dismissed {
-		if err := checkText("dismissed field", d.Field, maxFieldBytes, true); err != nil {
-			return err
-		}
-		if err := checkText("dismissed value", d.Value, maxValueBytes, true); err != nil {
-			return err
-		}
-		if err := checkText("dismissed by", d.By, maxByBytes, false); err != nil {
+		if err := checkDismissal(d); err != nil {
 			return err
 		}
 		if !p.dismissed(d.Field, d.Value) {
@@ -423,6 +458,28 @@ func (s *Store) importRecord(tx *bolt.Tx, r Record, rep *ImportReport) error {
 		}
 		setConsent(&p, c)
 		rep.Consents++
+	}
+	for _, in := range r.Answers {
+		a, err := s.prepareAnswer(in)
+		if err != nil {
+			return err
+		}
+		if _, err := setAnswer(&p, a); err != nil {
+			return err
+		}
+	}
+	names := make([]string, 0, len(r.Attachments))
+	for ns := range r.Attachments {
+		names = append(names, ns)
+	}
+	slices.Sort(names)
+	for _, ns := range names {
+		if err := checkAttachment(ns, r.Attachments[ns]); err != nil {
+			return err
+		}
+		if err := setAttachment(&p, ns, r.Attachments[ns]); err != nil {
+			return err
+		}
 	}
 	return putPerson(tx, p)
 }
